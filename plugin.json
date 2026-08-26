@@ -1,0 +1,92 @@
+{
+  "name": "VOD Episode Sweep",
+  "version": "1.0.0",
+  "description": "Learns which VOD series a client syncs and once a day refreshes ALL of each watched show's provider/category relations so new episodes stop going missing. Scoped to only the series you sync; runs in the background.",
+  "author": "andyj682",
+  "help_url": "https://github.com/andyj682/dispatcharr_vod_episode_sweep",
+  "fields": [
+    {
+      "id": "sweep_hour",
+      "label": "Earliest sweep hour (0-23)",
+      "type": "number",
+      "default": 3,
+      "help_text": "Hour the daily sweep runs, in Dispatcharr's configured system timezone. With Auto-run daily sweep on (below), a timer fires the sweep at this hour; otherwise it fires on the first client series request at/after this hour. Set it a bit BEFORE your client's daily sync so new episodes are ready in one pass. Default 3."
+    },
+    {
+      "id": "scheduled_sweep",
+      "label": "Auto-run daily sweep",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Automatically run the daily sweep on a timer at the hour above. When off, it still runs -- but only when a client next requests a series after that hour, which lags new episodes by an extra sync. Leave on unless you have a reason not to."
+    },
+    {
+      "id": "watchlist_ttl_days",
+      "label": "Watchlist TTL (days)",
+      "type": "number",
+      "default": 30,
+      "help_text": "Drop a series from the watchlist if it hasn't been requested (via get_series_info) for this many days. Keep this comfortably longer than your client's sync interval. Default 30."
+    },
+    {
+      "id": "sweep_batch_size",
+      "label": "Refresh batch size",
+      "type": "number",
+      "default": 20,
+      "help_text": "Series per background refresh task. Smaller batches spread the provider get_series_info calls into smaller bursts (gentler on provider rate limits). 0 = one task per account. Default 20."
+    },
+    {
+      "id": "sweep_spacing_seconds",
+      "label": "Refresh spacing (seconds)",
+      "type": "number",
+      "default": 15,
+      "help_text": "Delay inserted between successive refresh batches (via a Celery countdown) so they don't all hit the providers at once. 0 = fire everything immediately. Default 15."
+    },
+    {
+      "id": "schedule_queue",
+      "label": "Schedule queue (advanced)",
+      "type": "string",
+      "default": "dvr",
+      "help_text": "Advanced: the Celery queue the scheduled sweep is dispatched to. It must be served by a worker that loads plugins -- on a stock Dispatcharr that's the threads-pool 'dvr' worker (the default prefork worker rejects plugin tasks). Change only if your worker layout differs. If the scheduled sweep never runs, the opportunistic trigger still covers it."
+    },
+    {
+      "id": "_info",
+      "label": "",
+      "type": "info",
+      "description": "The watchlist is built automatically by observing the series your client requests over the XC API -- no manual list needed. A 'watchlist_debug.json' file is written in this plugin's folder (under data/plugins/) during each refresh. Only Xtream-Codes VOD series are affected."
+    }
+  ],
+  "actions": [
+    {
+      "id": "status",
+      "label": "Show status",
+      "description": "Report whether the patch is active, the schedule, and the watchlist size.",
+      "button_label": "Check status",
+      "button_variant": "outline"
+    },
+    {
+      "id": "list_watchlist",
+      "label": "List watched series",
+      "description": "Show the series currently on the watchlist and the path to the debug JSON file.",
+      "button_label": "List watchlist",
+      "button_variant": "outline"
+    },
+    {
+      "id": "refresh_now",
+      "label": "Run sweep now",
+      "description": "Run the episode sweep now, regardless of the daily timer.",
+      "button_label": "Run now",
+      "button_variant": "filled"
+    },
+    {
+      "id": "clear_watchlist",
+      "label": "Clear watchlist",
+      "description": "Forget every watched series. It will be rebuilt as clients request series again.",
+      "button_label": "Clear watchlist",
+      "button_variant": "light",
+      "button_color": "red",
+      "confirm": {
+        "title": "Clear the watchlist?",
+        "message": "This removes every remembered series. It rebuilds automatically as clients sync series again."
+      }
+    }
+  ]
+}
