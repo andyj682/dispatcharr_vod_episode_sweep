@@ -20,11 +20,25 @@ Checks (v0.2.0 model: inline run + opportunistic daily tick, no beat/plugin task
   * install() is reload-safe and cleans up the legacy beat task; inactive wrapper
     is a pure passthrough.
   * clear_watchlist empties the list.
+  * COMPAT GUARDS (v1.0.1): the wrapper accepts AND forwards parameters it does
+    not know about -- on the active and inactive paths alike -- so a future
+    upstream signature change cannot raise TypeError during argument binding;
+    drift leaves exactly one warning; the router's real call shape (module-global
+    lookup, string series_id from the query string) reaches the patch; and the
+    plugin logger carries its own level.
+
+A NOTE ON FIDELITY, since it is what makes these guards worth anything: a fake
+that only reproduces call shapes the plugin already handles cannot express a
+compatibility break. These fakes therefore mirror upstream's CURRENT signature
+and the way upstream actually calls it -- including that series_id arrives as a
+string. The structural parity test encodes no parameter list at all, so it
+survives this release and the next.
 
 Run:  python test_logic.py     (or: py -3 test_logic.py)
 """
 
 import importlib.util
+import logging
 import os
 import sys
 import types
@@ -127,6 +141,14 @@ class RelManager:
                m3u_account__account_type=None, **kw):
         rows = list(ENV.relations)
         if id is not None:
+            # Django coerces a string PK lookup to int on an integer field, and
+            # the XC router hands series_id straight from the query string
+            # (`request.GET.get("series_id")`), so it IS a string in production.
+            # Coerce here or the fake would be more forgiving than the real ORM.
+            try:
+                id = int(id)
+            except (TypeError, ValueError):
+                return RelQS([])
             rows = [r for r in rows if r["id"] == id]
         if series_id__in is not None:
             rows = [r for r in rows if r["series_id"] in series_id__in]
@@ -408,6 +430,37 @@ def reset(**kw):
     sys.modules["apps.output.views"].xc_get_series_info = lambda request, user, series_id: ("NATIVE", series_id)
 
 
+def call_wrapper(*args, **kwargs):
+    """Invoke the wrapper, turning a binding TypeError into a returned value.
+
+    A TypeError here IS the production failure mode, so it must be reported as a
+    failed check rather than raised -- otherwise it aborts the runner and hides
+    every test after it, which is the opposite of what a compat guard is for.
+    """
+    try:
+        return patch.patched_xc_get_series_info(*args, **kwargs)
+    except TypeError as exc:
+        return ("TYPE_ERROR", str(exc))
+
+
+class stubbed_tick:
+    """Suppress the opportunistic daily tick for wrapper-focused tests.
+
+    The tick would claim the day and spawn a real background sweep thread,
+    which makes assertions depend on thread timing and on the test machine's
+    wall-clock hour. These tests are about the wrapper's call contract.
+    """
+
+    def __enter__(self):
+        self._saved = patch._maybe_daily_sweep
+        patch._maybe_daily_sweep = lambda: None
+        return self
+
+    def __exit__(self, *exc):
+        patch._maybe_daily_sweep = self._saved
+        return False
+
+
 def seed_relations():
     """series 100 -> relation 11 (acct 7) + relation 12 (acct 9, a 4K category);
     series 200 -> relation 21 (acct 7); plus an inactive + a non-XC relation."""
@@ -670,6 +723,138 @@ def test_stale_audit_surfaced():
           summary["stale_by_account"] == {"Provider A": 3, "Provider B": 1})
 
 
+def test_wrapper_signature_is_open():
+    """Structural guard: encodes no parameter list, so it survives the NEXT
+    upstream change too."""
+    print("test_wrapper_signature_is_open")
+    import inspect
+    reset()
+    params = inspect.signature(patch.patched_xc_get_series_info).parameters
+    kinds = [p.kind for p in params.values()]
+    check("wrapper still mirrors core's three named params",
+          list(params)[:3] == ["request", "user", "series_id"])
+    check("wrapper accepts extra positionals (*args)",
+          inspect.Parameter.VAR_POSITIONAL in kinds)
+    check("wrapper accepts extra keywords (**kwargs)",
+          inspect.Parameter.VAR_KEYWORD in kinds)
+
+
+def test_signature_parity_accepts_and_forwards():
+    """The durable compat guard. A parameter added to core's xc_get_series_info
+    must be ACCEPTED (no TypeError at argument binding, which precedes the
+    _ACTIVE guard and the internal try) *and* FORWARDED (a swallowed parameter
+    silently drops something core relied on -- worse than a crash)."""
+    print("test_signature_parity_accepts_and_forwards")
+    reset()
+    seed_relations()
+    seen = {}
+
+    def spy(request, user, series_id, *args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return ("NATIVE", series_id)
+
+    patch._orig_xc_get_series_info = spy
+
+    with stubbed_tick():
+        # Mirror how core introduced its last new parameter: an unconditional
+        # keyword whose value is usually None. Add a positional too.
+        out = call_wrapper("req", "user", 11, "extra_positional", future_param=None)
+        check("unknown args accepted (no TypeError)", out == ("NATIVE", 11))
+        check("unknown positional forwarded to core",
+              seen.get("args") == ("extra_positional",))
+        check("unknown keyword forwarded to core",
+              seen.get("kwargs") == {"future_param": None})
+        check("observation still happens alongside",
+              "100" in patch.get_watchlist(force=True)["series"])
+
+        # The inactive path must forward too -- otherwise turning the feature
+        # off reintroduces the very crash this guards against.
+        seen.clear()
+        patch._ACTIVE = False
+        out2 = call_wrapper("req", "user", 21, "extra2", future_param=7)
+        patch._ACTIVE = True
+        check("inactive path accepts unknown args", out2 == ("NATIVE", 21))
+        check("inactive path forwards unknown positional",
+              seen.get("args") == ("extra2",))
+        check("inactive path forwards unknown keyword",
+              seen.get("kwargs") == {"future_param": 7})
+
+
+def test_signature_drift_is_logged_once():
+    print("test_signature_drift_is_logged_once")
+    reset()
+    seed_relations()
+    patch._orig_xc_get_series_info = lambda request, user, series_id, *a, **k: ("NATIVE", series_id)
+    patch._extra_args_logged = False
+
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture()
+    saved_propagate = patch.logger.propagate
+    patch.logger.addHandler(handler)
+    patch.logger.propagate = False  # keep the expected warning out of stderr
+    try:
+        with stubbed_tick():
+            call_wrapper("req", "user", 11, future_param=None)
+            warnings = [r for r in records if r.levelno == logging.WARNING]
+            check("drift leaves exactly one warning", len(warnings) == 1)
+            call_wrapper("req", "user", 21, future_param=None)
+            warnings = [r for r in records if r.levelno == logging.WARNING]
+            check("sensor is one-shot, not per-request", len(warnings) == 1)
+
+            records.clear()
+            patch._extra_args_logged = False
+            call_wrapper("req", "user", 11)  # today's shape
+            check("no warning when core's signature is unchanged",
+                  [r for r in records if r.levelno == logging.WARNING] == [])
+    finally:
+        patch.logger.removeHandler(handler)
+        patch.logger.propagate = saved_propagate
+        patch._extra_args_logged = False
+
+
+def test_router_call_shape_reaches_the_patch():
+    """Fidelity check on the CALL SITE, not just the signature: Dispatcharr's XC
+    router resolves the module global at call time and passes three positionals,
+    with series_id coming from the query string (so a STRING)."""
+    print("test_router_call_shape_reaches_the_patch")
+    reset()
+    seed_relations()
+    patch.install(manage_schedule=False)
+    try:
+        def fake_xc_player_api(series_id_param):
+            views = sys.modules["apps.output.views"]
+            return views.xc_get_series_info("req", "user", series_id_param)
+
+        with stubbed_tick():
+            out = fake_xc_player_api("11")
+        check("router's module-global lookup reaches the patched handler",
+              out == ("NATIVE", "11"))
+        check("string series_id from the query string still resolves",
+              "100" in patch.get_watchlist(force=True)["series"])
+    finally:
+        patch.uninstall()
+
+
+def test_plugin_logger_has_its_own_level():
+    """plugins.* is absent from Dispatcharr's LOGGING config, so without this the
+    logger inherits root -- which Celery's prefork pool leaves at WARNING in
+    forked children, silently discarding every plugin INFO record there."""
+    print("test_plugin_logger_has_its_own_level")
+    reset()
+    check("plugin logger is not left at NOTSET",
+          patch.logger.level != logging.NOTSET)
+    check("level adopted from the apps logger (so DISPATCHARR_LOG_LEVEL applies)",
+          patch.logger.level == logging.getLogger("apps").getEffectiveLevel())
+    check("plugin.py shares the same logger object",
+          logging.getLogger("plugins.dispatcharr_vod_episode_sweep") is patch.logger)
+
+
 def test_enqueue_failure_tolerated():
     print("test_enqueue_failure_tolerated")
     reset(delay_raises=True)
@@ -697,6 +882,11 @@ if __name__ == "__main__":
     test_throttle_chunks_and_staggers()
     test_stale_audit_surfaced()
     test_clear_watchlist()
+    test_wrapper_signature_is_open()
+    test_signature_parity_accepts_and_forwards()
+    test_signature_drift_is_logged_once()
+    test_router_call_shape_reaches_the_patch()
+    test_plugin_logger_has_its_own_level()
     test_enqueue_failure_tolerated()
     try:
         os.remove(_scratch)

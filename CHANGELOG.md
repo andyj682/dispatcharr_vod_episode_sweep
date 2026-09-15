@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-09-15
+
+Hardening only — **no functional change**. Both items close failure modes that
+are invisible until they bite.
+
+- **Signature-agnostic observation wrapper.** `patched_xc_get_series_info` now
+  accepts `*args, **kwargs` and forwards them to core at every call site,
+  including the inactive path. A parameter added to Dispatcharr's
+  `xc_get_series_info` previously raised `TypeError` during argument binding —
+  ahead of the plugin's own guard and `try`, so neither could fail open — and
+  the XC router does not catch it, which would have meant an HTTP 500 on every
+  series request rather than a quiet loss of function. Because the wrapper is a
+  pure observer that always delegates, forwarding is sufficient; there is
+  nothing a new parameter could require the plugin to honour on core's behalf.
+  If extra parameters ever do arrive, the plugin logs one warning so the change
+  leaves a trace instead of passing unnoticed.
+- **Plugin logger gets its own level.** `plugins.*` is not in Dispatcharr's
+  `LOGGING` config, so a plugin logger inherits root's effective level; Celery's
+  prefork pool leaves root at `WARNING` in forked children, which silently
+  discards plugin `INFO` records there. The logger now adopts the `apps` level
+  (so `DISPATCHARR_LOG_LEVEL` still applies), guarded on `NOTSET` so a
+  deliberately-set level is respected. This plugin's own code does not currently
+  run in a prefork child, so this is insurance rather than a fix.
+
 ## [1.0.0] - 2026-08-27
 
 First stable release. No functional changes from 0.4.0 — the version bump marks

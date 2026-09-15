@@ -56,7 +56,7 @@ class Plugin:
     # UI title only. README / repo / zip keep the fuller "Dispatcharr VOD
     # Episode Sweep" name; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Episode Sweep"
-    version = "1.0.0"
+    version = "1.0.1"
     description = (
         "Learns which VOD series a client syncs and once a day refreshes ALL of "
         "each watched show's provider/category relations so new episodes stop "

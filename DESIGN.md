@@ -131,6 +131,66 @@ the sweep hour a bit before your client's sync.
   `last_sweep`, so a silently-failing provider is visible rather than leaving
   relations stuck `fetched False` unnoticed.
 
+## Surviving an upstream signature change (v1.0.1)
+
+"Fail-open" is the plugin's core safety property, but it has a precise limit
+worth stating: it covers what happens *inside* the wrapper and nothing that
+happens *before the wrapper is entered*. If a Dispatcharr release adds a
+parameter to `xc_get_series_info`, a fixed-signature wrapper raises `TypeError`
+while Python binds the arguments — ahead of the `_ACTIVE` guard and ahead of the
+internal `try`, so neither can fail open. The XC router calls this handler inside
+`JsonResponse(...)` with no `try/except` of its own, so that error would surface
+as an **HTTP 500 on every series request**, taking the whole episode sync down
+rather than quietly costing it a feature. The plugin's own enable/disable
+*setting* could not rescue it either, since the failure precedes any setting
+lookup; only fully disabling the plugin (which restores the original function
+object) would.
+
+So the wrapper accepts `*args, **kwargs` and forwards them verbatim at **every**
+call of the original — including the inactive early-return, because otherwise
+turning the feature off would reintroduce exactly the crash being guarded
+against.
+
+**Is forwarding enough here?** Yes, and the reason is specific to this wrapper's
+shape rather than a general rule. Forwarding stops the crash but does not by
+itself keep a plugin *correct*: a wrapper that replaces or reshapes core's
+behaviour may find that a newly added parameter was something core enforced on
+its behalf, which nothing then honours. This wrapper is a **pure observer** — it
+records the series, optionally fires the daily tick, and returns core's own
+result untouched on every path. It never substitutes its own return value and
+never filters or reorders anything core produced. There is therefore nothing a
+new parameter could oblige it to honour; passing it straight through leaves core
+applying it exactly as before.
+
+One consequence of hardening worth naming: forwarding makes such a change
+*invisible*, because nothing fails any more. To avoid trading a loud break for
+silent drift, the wrapper logs a single `warning` the first time it ever receives
+parameters it does not recognise — enough to leave a trace for the next
+compatibility check without adding per-request noise.
+
+## Logging: the plugin logger sets its own level (v1.0.1)
+
+Dispatcharr's `LOGGING` config names the loggers it manages (`apps`, `celery`,
+`core.*`, `django.geventpool`, root) and gives each its own handler with
+`propagate: False`. **`plugins.*` is not among them**, so a plugin logger has no
+handler, no level, and inherits root's *effective* level. That is fine in uWSGI,
+daphne and a Celery worker parent, where root is at INFO — but Celery's prefork
+pool reconfigures root in each forked child and leaves it at **WARNING**, which
+discards every plugin `INFO` record *at the logger*, before any handler sees it.
+Core's own `apps.*` lines from the same process still appear, because that logger
+has its own handler. The result is that a perfectly working plugin looks exactly
+like an absent one.
+
+This plugin's code does not currently run in a prefork child — the observer and
+the inline sweep run in uWSGI, the scheduled task runs on the single-process
+threads-pool worker, and the only thing sent to the prefork worker is core's own
+`batch_refresh_series_episodes` — so this is insurance rather than a fix. It is
+cheap insurance worth having, because the failure mode is invisible by
+construction: you would only learn you needed it from an absence, and absences
+are not noticed. The logger adopts the `apps` logger's effective level rather
+than hard-coding `INFO`, so `DISPATCHARR_LOG_LEVEL` still applies, and the change
+is guarded on `NOTSET` so anything that deliberately set a level keeps control.
+
 ## Note: the self-sustaining loop and the `last_modified` invariant
 
 The watchlist is self-sustaining without periodic re-seeding, given how the .strm

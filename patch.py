@@ -62,6 +62,16 @@ triggered it.
 
 Everything is fail-open: observation and both triggers never affect the XC
 response, and any failure leaves native behaviour untouched.
+
+Signature-agnostic wrapper
+--------------------------
+"Fail-open" covers what happens *inside* the wrapper and is useless for what
+happens *before it is entered*. A parameter added to core's `xc_get_series_info`
+would raise `TypeError` while binding arguments -- ahead of the `_ACTIVE` guard
+and the internal `try` -- and the XC router does not catch it, so an upstream
+signature change would mean HTTP 500 on every series request rather than a quiet
+loss of function. The wrapper therefore accepts `*args, **kwargs` and forwards
+them at every call of the original, and logs once if it ever sees any.
 """
 
 from __future__ import annotations
@@ -73,6 +83,19 @@ import threading
 import time
 
 logger = logging.getLogger("plugins.dispatcharr_vod_episode_sweep")
+
+# Dispatcharr's LOGGING dictConfig names the loggers it manages (`apps`,
+# `celery`, `core.*`, `django.geventpool`, root) and gives each its own handler
+# with propagate=False. `plugins.*` is NOT among them, so a plugin logger has no
+# handler, no level, and inherits root's EFFECTIVE level. That is fine in uWSGI
+# (root at INFO), but Celery's prefork pool reconfigures root in each forked
+# child and leaves it at WARNING -- which discards every plugin `logger.info()`
+# at the logger, before any handler sees it, making a working plugin look
+# identical to an absent one. Adopting `apps`'s level fixes that while still
+# honouring DISPATCHARR_LOG_LEVEL; the NOTSET guard leaves an operator (or a
+# test) that deliberately set a level in control.
+if logger.level == logging.NOTSET:
+    logger.setLevel(logging.getLogger("apps").getEffectiveLevel() or logging.INFO)
 
 try:
     from celery import shared_task
@@ -135,6 +158,9 @@ DAILY_KEY_TTL = 129600          # 36h, so the day-key self-expires
 _ACTIVE = False
 _orig_xc_get_series_info = None
 _PATCH_TAG = "_vodsweep_patched"
+
+# One-shot flag for the signature-drift sensor (see _log_unexpected_args_once).
+_extra_args_logged = False
 
 _pid_logged = set()
 
@@ -479,18 +505,56 @@ def _observe(series_id) -> None:
                      series_id, exc_info=True)
 
 
-def patched_xc_get_series_info(request, user, series_id):
+def _log_unexpected_args_once(args, kwargs) -> None:
+    """One-shot sensor for upstream signature drift.
+
+    Forwarding unknown parameters is what keeps the wrapper working -- but it
+    also makes the change invisible, since nothing fails any more. So leave
+    exactly one trace per process that a later compat check can find. Uses
+    `warning` deliberately: it survives even where a pool has left root at
+    WARNING, which is precisely where a plugin's INFO lines do not.
+    """
+    global _extra_args_logged
+    if _extra_args_logged or not (args or kwargs):
+        return
+    _extra_args_logged = True
+    logger.warning(
+        "[VOD-SWEEP] xc_get_series_info was called with %s extra positional "
+        "arg(s) and keyword(s) %s -- forwarded unchanged, so nothing is broken, "
+        "but core's signature has changed: re-check this plugin against the "
+        "current Dispatcharr release.",
+        len(args), sorted(kwargs),
+    )
+
+
+def patched_xc_get_series_info(request, user, series_id, *args, **kwargs):
     """Observe the requested series + maybe fire the daily sweep, then return the
-    native response unchanged."""
+    native response unchanged.
+
+    The trailing `*args, **kwargs` are load-bearing, not tidiness. If a release
+    adds a parameter to core's `xc_get_series_info`, a fixed signature raises
+    `TypeError` during ARGUMENT BINDING -- before this body runs, therefore
+    before the `_ACTIVE` guard and before the `try` below, so neither can
+    fail open. The XC router calls this inside `JsonResponse(...)` with no
+    `try/except` of its own, so that `TypeError` would surface as an HTTP 500 on
+    every series request and take the whole episode sync down. Accept anything,
+    and forward it verbatim at EVERY call of the original -- the inactive path
+    included, or disabling the feature would reintroduce the same crash.
+
+    This wrapper is a pure observer: it always delegates and never alters what
+    core returns, so forwarding is sufficient and there is nothing a new
+    parameter could require us to honour on core's behalf.
+    """
     if not _ACTIVE:
-        return _orig_xc_get_series_info(request, user, series_id)
+        return _orig_xc_get_series_info(request, user, series_id, *args, **kwargs)
     _log_pid_once("get_series_info")
     try:
+        _log_unexpected_args_once(args, kwargs)
         _observe(series_id)
         _maybe_daily_sweep()
     except Exception:
         logger.debug("[VOD-SWEEP] observation hook error (ignored)", exc_info=True)
-    return _orig_xc_get_series_info(request, user, series_id)
+    return _orig_xc_get_series_info(request, user, series_id, *args, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
