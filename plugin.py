@@ -56,7 +56,7 @@ class Plugin:
     # UI title only. README / repo / zip keep the fuller "Dispatcharr VOD
     # Episode Sweep" name; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Episode Sweep"
-    version = "1.0.1"
+    version = "1.1.0"
     description = (
         "Learns which VOD series a client syncs and once a day refreshes ALL of "
         "each watched show's provider/category relations so new episodes stop "
@@ -178,6 +178,13 @@ class Plugin:
             "button_variant": "filled",
         },
         {
+            "id": "retry_stale",
+            "label": "Retry stale relations",
+            "description": "Retry only relations still flagged stale.",
+            "button_label": "Retry stale",
+            "button_variant": "filled",
+        },
+        {
             "id": "clear_watchlist",
             "label": "Clear watchlist",
             "description": "Forget every watched series. It will be rebuilt as "
@@ -213,17 +220,31 @@ class Plugin:
             cfg = _patch._load_config(force=True)
             wl = _patch.get_watchlist(force=True)
             last = wl.get("last_sweep")
+            last_retry = wl.get("last_retry")
+            # `last_sweep` is a snapshot taken BEFORE that sweep fanned out, so
+            # it can be a day old and describe a state that no longer exists.
+            # The live audit is what reflects right now.
+            live = _patch.live_stale_summary()
+            by_acct = ", ".join(f"{k} {v}" for k, v in sorted(live["by_account"].items()))
+            age = live.get("by_age") or {}
+            age_str = " ".join(f"{k}={age.get(k, 0)}" for k in ("never", "1", "2", "3+"))
+            # Deliberately terse: the UI's result box truncates a long message,
+            # and the per-account stale breakdown is the part worth protecting.
             return {
                 "status": "ok",
                 "message": (
-                    f"active={_patch._ACTIVE} in worker pid={os.getpid()} "
-                    f"(reflects ONE worker; check logs for all pids). "
-                    f"sweep_hour={cfg['sweep_hour']:02d}:00, "
-                    f"scheduled={cfg['scheduled_sweep']} (queue={cfg['schedule_queue']}), "
-                    f"ttl={cfg['ttl_seconds'] / 86400.0:.0f}d, "
-                    f"batch={cfg['batch_size']}, spacing={cfg['spacing_seconds']:.0f}s, "
-                    f"watched={len(wl.get('series', {}))}, "
-                    f"last_sweep={last}"
+                    f"active={_patch._ACTIVE} pid={os.getpid()} (one worker; see logs for all)\n"
+                    f"sweep {cfg['sweep_hour']:02d}:00 | auto={cfg['scheduled_sweep']} "
+                    f"q={cfg['schedule_queue']} | ttl={cfg['ttl_seconds'] / 86400.0:.0f}d "
+                    f"batch={cfg['batch_size']} space={cfg['spacing_seconds']:.0f}s | "
+                    f"watched={len(wl.get('series', {}))}\n\n"
+                    f"STALE NOW: {live['total']}"
+                    + (f" ({by_acct})" if by_acct else "")
+                    + f" | age(cycles) {age_str}"
+                    + (f" | audit error: {live['error']}" if live.get("error") else "")
+                    + "\n\n"
+                    + _patch.format_run_record("last sweep", last) + "\n"
+                    + _patch.format_run_record("last retry", last_retry)
                 ),
             }
 
@@ -246,6 +267,16 @@ class Plugin:
             except Exception as exc:
                 logger.exception("[VOD-SWEEP] refresh_now failed")
                 return {"status": "error", "message": f"Sweep failed: {exc}"}
+
+        if action == "retry_stale":
+            # Same inline/web-worker pattern as refresh_now, but scoped to the
+            # relations that are actually stale.
+            try:
+                summary = _patch.retry_stale_impl()
+                return {"status": "ok", "message": f"Retry ran: {summary}"}
+            except Exception as exc:
+                logger.exception("[VOD-SWEEP] retry_stale failed")
+                return {"status": "error", "message": f"Retry failed: {exc}"}
 
         if action == "clear_watchlist":
             try:

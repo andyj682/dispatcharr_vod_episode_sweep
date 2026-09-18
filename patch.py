@@ -364,7 +364,7 @@ def is_enabled() -> bool:
 # Shape: {"series": {"<pk>": <last_seen_epoch>}, "last_sweep": {...}|None}
 
 def _empty_watchlist() -> dict:
-    return {"series": {}, "last_sweep": None}
+    return {"series": {}, "last_sweep": None, "last_retry": None}
 
 
 def _read_watchlist_raw() -> dict:
@@ -378,7 +378,14 @@ def _read_watchlist_raw() -> dict:
     series = val.get("series")
     if not isinstance(series, dict):
         series = {}
-    return {"series": series, "last_sweep": val.get("last_sweep")}
+    # NB: this rebuilds the dict key-by-key, so ANY new persisted field must be
+    # listed here or it is silently dropped on read while still sitting in the
+    # DB -- writes go through _mutate_watchlist, which preserves the whole row.
+    return {
+        "series": series,
+        "last_sweep": val.get("last_sweep"),
+        "last_retry": val.get("last_retry"),
+    }
 
 
 def _mutate_watchlist(mutate) -> dict:
@@ -650,11 +657,30 @@ def _accounts_by_series(series_pks):
     return {aid: sorted(pks) for aid, pks in by_account.items()}
 
 
-def _stale_by_account(series_pks, hours=STALE_HOURS):
-    """{account_name: count} of watched relations not episode-refreshed in >hours
-    (None or old last_episode_refresh) -- i.e. likely provider failures last cycle
-    (or not yet swept, on a first run). Uses last_episode_refresh, which -- unlike
-    the episodes_fetched flag -- survives the listing scan's clobbering."""
+def _safe_err(exc) -> str:
+    """Exception text with any URL stripped.
+
+    Dispatcharr's own XC errors embed the provider username and password in the
+    failing URL. This plugin must never copy that into its own log lines, so
+    everything from " for url" onwards is dropped.
+    """
+    try:
+        msg = str(exc).split(" for url")[0].strip()
+    except Exception:
+        msg = ""
+    return f"{type(exc).__name__}: {msg[:80]}" if msg else type(exc).__name__
+
+
+def _stale_rows(series_pks, hours=STALE_HOURS):
+    """Watched relations not episode-refreshed in >hours, as rows of
+    (m3u_account_id, m3u_account__name, series_id).
+
+    THE single definition of "stale", shared by the health summary and the
+    retry pass so the two can never drift apart. Keyed on
+    `last_episode_refresh` which -- unlike the `episodes_fetched` flag --
+    survives the listing scan's clobbering. A null timestamp counts as stale
+    (never refreshed).
+    """
     from datetime import timedelta
     from django.db.models import Q
     from django.utils import timezone as dj_tz
@@ -662,19 +688,210 @@ def _stale_by_account(series_pks, hours=STALE_HOURS):
     from apps.vod.models import M3USeriesRelation
 
     cutoff = dj_tz.now() - timedelta(hours=hours)
-    names = (
+    return list(
         M3USeriesRelation.objects.filter(
             series_id__in=series_pks,
             m3u_account__is_active=True,
             m3u_account__account_type=M3UAccount.Types.XC,
         )
         .filter(Q(last_episode_refresh__isnull=True) | Q(last_episode_refresh__lt=cutoff))
-        .values_list("m3u_account__name", flat=True)
+        .values("m3u_account_id", "m3u_account__name", "series_id",
+                "last_episode_refresh")
     )
+
+
+def _stale_cycles(last_refresh, now) -> int:
+    """How many ~daily cycles a relation has been stale. 0 == never refreshed."""
+    if last_refresh is None:
+        return 0
+    try:
+        hours = (now - last_refresh).total_seconds() / 3600.0
+    except Exception:
+        return 0
+    return max(1, int(hours // 24))
+
+
+def _stale_age_buckets(rows, now=None):
+    """{'never': n, '1': n, '2': n, '3+': n} -- stale relations by age in cycles.
+
+    Why this is worth surfacing: when a provider fails a fraction of its
+    requests at RANDOM, the chance of the SAME relation missing N cycles in a
+    row is p**N. At a ~27% failure rate that is ~7% for two cycles and ~0.5%
+    for four. So a relation stale for several cycles is very unlikely to be
+    merely unlucky -- it is a genuine dead-content candidate (a title the
+    provider dropped, or an `external_series_id` it no longer recognises).
+    That separates the two populations far more sharply than counting
+    failures, which mixes them together.
+    """
+    if now is None:
+        from django.utils import timezone as dj_tz
+        now = dj_tz.now()
+    out = {"never": 0, "1": 0, "2": 0, "3+": 0}
+    for row in rows:
+        cycles = _stale_cycles(row.get("last_episode_refresh"), now)
+        if cycles == 0:
+            out["never"] += 1
+        elif cycles >= 3:
+            out["3+"] += 1
+        else:
+            out[str(cycles)] += 1
+    return out
+
+
+def _stale_by_account(series_pks, hours=STALE_HOURS):
+    """{account_name: stale relation count} -- the health summary. A non-zero
+    count means those relations did not refresh last cycle (provider errors),
+    or have never been swept."""
     out = {}
-    for name in names:
+    for row in _stale_rows(series_pks, hours):
+        name = row.get("m3u_account__name")
         out[name] = out.get(name, 0) + 1
     return out
+
+
+def _stale_series_by_account(series_pks, hours=STALE_HOURS, rows=None, now=None):
+    """{account_id: [series_pk, ...]} -- the retry set, WORST-STALE FIRST.
+
+    NOTE THE GRANULARITY: core's `batch_refresh_series_episodes` takes SERIES
+    ids, not relation ids, so retrying a series re-refreshes every relation of
+    that series on that account, stale or not. In practice the stale set is
+    close to 1:1 with series, and targeting individual relations would mean
+    patching core, which this plugin deliberately does not do.
+
+    Ordering is by how long the series' WORST relation has been stale
+    (never-refreshed first, then oldest). Chunks are dispatched with an
+    increasing countdown, so the longest-suffering relations get attempted
+    first and are the least likely to be left out if a pass is cut short or
+    the provider degrades partway through.
+    """
+    if rows is None:
+        rows = _stale_rows(series_pks, hours)
+    if now is None:
+        from django.utils import timezone as dj_tz
+        now = dj_tz.now()
+
+    worst = {}  # (account_id, series_id) -> max cycles stale
+    for row in rows:
+        key = (row["m3u_account_id"], row["series_id"])
+        cycles = _stale_cycles(row.get("last_episode_refresh"), now)
+        # 0 means "never refreshed" -- treat as the most stale of all.
+        rank = float("inf") if cycles == 0 else cycles
+        if rank > worst.get(key, -1):
+            worst[key] = rank
+
+    by_account = {}
+    for (account_id, series_id), rank in worst.items():
+        by_account.setdefault(account_id, []).append((rank, series_id))
+    return {
+        aid: [sid for _, sid in sorted(pairs, key=lambda p: (-p[0], p[1]))]
+        for aid, pairs in by_account.items()
+    }
+
+
+def _provider_reachable(account_id, attempts=2) -> bool:
+    """Pre-flight: does this account's XC panel answer an authentication call?
+
+    **Deliberately FAILS OPEN.** Anything short of a confident, repeated
+    failure returns True, because wrongly skipping a healthy account costs that
+    provider a whole day of refreshes -- worse than attempting it and having
+    most calls succeed. Only a panel that fails every attempt is skipped.
+
+    Scope: this catches a TOTAL outage. A partially degraded panel (failing
+    some fraction of requests at random) will usually pass, and should -- most
+    of its refreshes will work. `refresh_series_episodes` authenticates before
+    every lookup, so a dead panel otherwise produces one failed handshake per
+    relation: hundreds of doomed calls and hundreds of error lines.
+    """
+    try:
+        from apps.m3u.models import M3UAccount
+        from core.xtream_codes import Client as XtreamCodesClient
+    except Exception:
+        return True  # can't probe -> never block the sweep
+    try:
+        account = M3UAccount.objects.filter(id=account_id).first()
+        if account is None:
+            return True
+    except Exception:
+        return True
+
+    last = None
+    for _ in range(max(1, int(attempts))):
+        try:
+            with XtreamCodesClient(
+                account.server_url,
+                account.username,
+                account.password,
+                account.get_user_agent_string(),
+            ) as client:
+                client.authenticate()
+            return True
+        except Exception as exc:
+            last = exc
+    logger.warning(
+        "[VOD-SWEEP] account=%s failed %s pre-flight auth attempt(s) (%s); "
+        "skipping it this pass -- its relations stay stale until the panel "
+        "recovers",
+        account_id, attempts, _safe_err(last),
+    )
+    return False
+
+
+def _filter_reachable(by_account, summary):
+    """Drop accounts whose panel is not answering, recording each skip.
+
+    A skip is recorded in the summary AND logged at warning level on purpose: a
+    quietly smaller sweep, a climbing stale count and no explanation is exactly
+    the silent degradation this plugin exists to make visible.
+    """
+    reachable = {}
+    for account_id, account_pks in by_account.items():
+        if _provider_reachable(account_id):
+            reachable[account_id] = account_pks
+        else:
+            summary["skipped_accounts"].append(account_id)
+    if summary["skipped_accounts"]:
+        logger.warning(
+            "[VOD-SWEEP] skipped %s unreachable account(s) this pass: %s",
+            len(summary["skipped_accounts"]), summary["skipped_accounts"],
+        )
+    return reachable
+
+
+def _dispatch_refresh(by_account, batch_size, spacing):
+    """Chunk each account's series and enqueue the CORE refresh task with a
+    staggered countdown. Returns (tasks_enqueued, spread_seconds).
+
+    Shared by the daily sweep and the stale-retry pass so both throttle
+    identically. Fail-open per chunk: a broker error is logged and skipped
+    rather than aborting the pass.
+    """
+    from apps.vod.tasks import batch_refresh_series_episodes
+
+    tasks = 0
+    idx = 0  # global chunk index -> staggered countdown across all accounts
+    for account_id, account_pks in by_account.items():
+        if batch_size and batch_size > 0:
+            chunks = [account_pks[i:i + batch_size]
+                      for i in range(0, len(account_pks), batch_size)]
+        else:
+            chunks = [account_pks]
+        for chunk in chunks:
+            countdown = int(idx * spacing) if spacing > 0 else 0
+            try:
+                batch_refresh_series_episodes.apply_async(
+                    args=[account_id], kwargs={"series_ids": chunk},
+                    countdown=countdown,
+                )
+                tasks += 1
+                idx += 1
+            except Exception as exc:
+                logger.warning("[VOD-SWEEP] enqueue failed account=%s: %s", account_id, exc)
+        logger.info(
+            "[VOD-SWEEP] queued %s task(s) for account=%s (%s watched series)",
+            len(chunks), account_id, len(account_pks),
+        )
+    spread = int((idx - 1) * spacing) if (idx and spacing > 0) else 0
+    return tasks, spread
 
 
 def _series_names(series_pks):
@@ -748,6 +965,79 @@ def _record_sweep_result(summary) -> None:
     _mutate_watchlist(_mut)
 
 
+def _record_retry_result(summary) -> None:
+    """Persist the retry outcome separately from `last_sweep`.
+
+    A retry is a repair, not a trigger, so it must not overwrite the sweep's
+    record -- but it does need to be durable, or the only trace of it is the
+    action response the operator happened to be looking at.
+    """
+    def _mut(data):
+        data["last_retry"] = summary
+        return True
+    _mutate_watchlist(_mut)
+
+
+def format_run_record(label, rec) -> str:
+    """One compact line for a stored run record.
+
+    The raw dict repr runs to ~180 characters, and the UI's action-result box
+    truncates: v1.1.0 first shipped status dumping the dicts and the message
+    was cut off mid-field, hiding the per-account stale breakdown entirely.
+    Keep this terse.
+    """
+    if not rec:
+        return f"{label}: none yet"
+    bits = [str(rec.get("at", "?"))]
+    if rec.get("watched") is not None:
+        bits.append(f"{rec['watched']} watched")
+    if rec.get("retried_series") is not None:
+        bits.append(f"{rec['retried_series']} retried")
+    bits.append(f"{rec.get('accounts', 0)} acct")
+    bits.append(f"{rec.get('tasks', 0)} tasks")
+    bits.append(f"~{rec.get('spread_seconds', 0)}s")
+    out = f"{label}: " + " | ".join(bits)
+    if rec.get("stale_total") is not None:
+        pre = rec.get("stale_by_account") or {}
+        flat = ", ".join(f"{k} {v}" for k, v in sorted(pre.items()))
+        out += f" | stale before run {rec['stale_total']}"
+        if flat:
+            out += f" ({flat})"
+    if rec.get("skipped"):
+        out += f" | skipped: {rec['skipped']}"
+    if rec.get("skipped_accounts"):
+        out += f" | UNREACHABLE {rec['skipped_accounts']}"
+    return out
+
+
+def live_stale_summary() -> dict:
+    """Audit staleness RIGHT NOW, for the status action.
+
+    `last_sweep` carries a snapshot taken before that sweep fanned out, so it
+    can be up to a day old and says nothing about the current state -- which is
+    an easy way to misread the system entirely. This gives the live picture,
+    broken down per account and by how long things have been stale.
+    """
+    out = {"total": 0, "by_account": {}, "by_age": {}, "error": None}
+    try:
+        data = get_watchlist(force=True)
+        pks = [int(k) for k in data.get("series", {}).keys() if str(k).isdigit()]
+        if not pks:
+            return out
+        rows = _stale_rows(pks)
+        out["total"] = len(rows)
+        counts = {}
+        for row in rows:
+            name = row.get("m3u_account__name")
+            counts[name] = counts.get(name, 0) + 1
+        out["by_account"] = counts
+        out["by_age"] = _stale_age_buckets(rows)
+    except Exception as exc:
+        out["error"] = _safe_err(exc)
+        logger.debug("[VOD-SWEEP] live stale audit failed (ignored)", exc_info=True)
+    return out
+
+
 def run_sweep_impl() -> dict:
     """Refresh every relation of each watched series, per carrying XC account, by
     enqueuing the CORE batch_refresh_series_episodes task. Runs inline in the
@@ -757,7 +1047,8 @@ def run_sweep_impl() -> dict:
     summary = {
         "at": _now_local().strftime("%Y-%m-%d %H:%M:%S"),
         "watched": 0, "accounts": 0, "tasks": 0, "pruned": 0,
-        "spread_seconds": 0, "stale_total": 0, "stale_by_account": {}, "skipped": None,
+        "spread_seconds": 0, "stale_total": 0, "stale_by_account": {},
+        "skipped_accounts": [], "skipped": None,
     }
     try:
         if not is_enabled():
@@ -792,36 +1083,15 @@ def run_sweep_impl() -> dict:
             logger.debug("[VOD-SWEEP] staleness audit failed (ignored)", exc_info=True)
 
         by_account = _accounts_by_series(pks)
+
+        # Pre-flight each account before fanning out: one request apiece saves
+        # hundreds of doomed refreshes when a provider's panel is down.
+        by_account = _filter_reachable(by_account, summary)
         summary["accounts"] = len(by_account)
 
-        batch_size = cfg["batch_size"]
-        spacing = cfg["spacing_seconds"]
-
-        from apps.vod.tasks import batch_refresh_series_episodes
-        idx = 0  # global chunk index -> staggered countdown across all accounts
-        for account_id, account_pks in by_account.items():
-            if batch_size and batch_size > 0:
-                chunks = [account_pks[i:i + batch_size]
-                          for i in range(0, len(account_pks), batch_size)]
-            else:
-                chunks = [account_pks]
-            for chunk in chunks:
-                countdown = int(idx * spacing) if spacing > 0 else 0
-                try:
-                    batch_refresh_series_episodes.apply_async(
-                        args=[account_id], kwargs={"series_ids": chunk},
-                        countdown=countdown,
-                    )
-                    summary["tasks"] += 1
-                    idx += 1
-                except Exception as exc:
-                    logger.warning("[VOD-SWEEP] enqueue failed account=%s: %s", account_id, exc)
-            logger.info(
-                "[VOD-SWEEP] queued %s task(s) for account=%s (%s watched series)",
-                len(chunks), account_id, len(account_pks),
-            )
-
-        summary["spread_seconds"] = int((idx - 1) * spacing) if (idx and spacing > 0) else 0
+        summary["tasks"], summary["spread_seconds"] = _dispatch_refresh(
+            by_account, cfg["batch_size"], cfg["spacing_seconds"],
+        )
         _record_sweep_result(summary)
         _write_debug_file(last_sweep=summary)
         logger.info(
@@ -833,6 +1103,93 @@ def run_sweep_impl() -> dict:
         return summary
     except Exception:
         logger.exception("[VOD-SWEEP] sweep failed (ignored)")
+        return summary
+    finally:
+        try:
+            close_old_connections()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# Stale-retry pass (manual, cheap counterpart to a full sweep)
+# --------------------------------------------------------------------------- #
+
+def retry_stale_impl() -> dict:
+    """Re-refresh ONLY the relations currently flagged stale.
+
+    Why this exists: a provider panel that fails a fraction of its requests at
+    random leaves a different slice of relations unrefreshed each pass. Because
+    those failures are independent, re-attempting just the stragglers clears
+    most of them -- and the stale set is normally a small fraction of the
+    watchlist, so it costs a fraction of a full sweep. Repeat it and the
+    remainder shrinks geometrically.
+
+    It does NOT touch the daily Redis claim, so it can never suppress the
+    scheduled sweep. Fail-open throughout, like every other path here.
+    """
+    from django.db import close_old_connections
+
+    summary = {
+        "at": _now_local().strftime("%Y-%m-%d %H:%M:%S"),
+        "stale_total": 0, "stale_by_account": {}, "stale_by_age": {},
+        "retried_series": 0, "accounts": 0, "tasks": 0, "spread_seconds": 0,
+        "skipped_accounts": [], "skipped": None,
+    }
+    try:
+        if not is_enabled():
+            summary["skipped"] = "plugin disabled"
+            return summary
+
+        cfg = _load_config(force=True)
+        data = get_watchlist(force=True)
+        pks = [int(k) for k in data.get("series", {}).keys() if str(k).isdigit()]
+        if not pks:
+            summary["skipped"] = "watchlist empty"
+            logger.info("[VOD-SWEEP] retry: watchlist empty, nothing to do")
+            return summary
+
+        # Audited fresh on every call, BEFORE dispatching -- so clicking retry
+        # again after the previous pass has drained is how you read its result.
+        # Broken out per account because a skipped (unreachable) provider keeps
+        # its whole backlog, which would otherwise mask a real improvement
+        # elsewhere in the total.
+        rows = _stale_rows(pks)
+        counts = {}
+        for row in rows:
+            name = row.get("m3u_account__name")
+            counts[name] = counts.get(name, 0) + 1
+        summary["stale_by_account"] = counts
+        summary["stale_total"] = len(rows)
+        summary["stale_by_age"] = _stale_age_buckets(rows)
+        # Worst-stale first: the longest-suffering relations are dispatched in
+        # the earliest chunks. Rows are reused so the audit and the retry set
+        # are guaranteed to describe the same instant.
+        by_account = _stale_series_by_account(pks, rows=rows)
+        if not by_account:
+            summary["skipped"] = "nothing stale"
+            _record_retry_result(summary)
+            logger.info("[VOD-SWEEP] retry: nothing stale, nothing to do")
+            return summary
+
+        by_account = _filter_reachable(by_account, summary)
+        summary["accounts"] = len(by_account)
+        summary["retried_series"] = sum(len(v) for v in by_account.values())
+
+        summary["tasks"], summary["spread_seconds"] = _dispatch_refresh(
+            by_account, cfg["batch_size"], cfg["spacing_seconds"],
+        )
+        _record_retry_result(summary)
+        logger.info(
+            "[VOD-SWEEP] retry done: %s stale relation(s) %s, retried %s series "
+            "across %s account(s), %s task(s) spread over ~%ss",
+            summary["stale_total"], summary["stale_by_age"],
+            summary["retried_series"], summary["accounts"],
+            summary["tasks"], summary["spread_seconds"],
+        )
+        return summary
+    except Exception:
+        logger.exception("[VOD-SWEEP] retry failed (ignored)")
         return summary
     finally:
         try:

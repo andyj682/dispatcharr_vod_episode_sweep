@@ -4,6 +4,72 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-09-17
+
+Adds a targeted retry, and stops the sweep hammering a provider whose API is
+down. Both come out of a live diagnosis where one provider's panel was
+returning errors for every request while another failed a fraction of them at
+random.
+
+### Added
+
+- **"Retry stale relations" action.** Re-refreshes only the relations currently
+  flagged stale, rather than the whole watchlist. The stale set is normally a
+  small slice of it, so this costs a fraction of a full sweep. Because a
+  partially-failing provider misses a *different, random* slice each pass,
+  repeating the retry shrinks the remainder geometrically. It reuses the
+  sweep's batch-size and spacing throttle, and deliberately does not touch the
+  daily claim, so it can never suppress the scheduled sweep.
+- **Pre-flight provider check, used by both the sweep and the retry.** Each
+  account's XC panel is probed once before fanning out; an account that is not
+  answering is skipped. When a panel is down, `refresh_series_episodes`
+  authenticates before every lookup, so without this a sweep produces one
+  failed handshake per relation — hundreds of doomed requests at an already
+  struggling provider, and hundreds of error lines.
+  - The probe **fails open**: it retries, and only skips an account that fails
+    every attempt. Wrongly skipping a healthy provider would cost it a whole
+    day of refreshes, which is worse than attempting it and having most calls
+    succeed.
+  - It catches a *total* outage, not partial degradation — a provider failing
+    some fraction of requests will usually pass, and should.
+  - A skip is reported in `last_sweep` as `skipped_accounts` **and** logged as
+    a warning. A quietly smaller sweep with a climbing stale count and no
+    explanation is precisely the silent failure this plugin exists to surface.
+
+- **Live staleness in "Show status", with an age breakdown.** `last_sweep` is a
+  snapshot taken *before* that sweep fanned out, so it can be a day old and
+  describe a state that no longer exists — which makes it easy to misread the
+  system entirely (a provider can have recovered hours ago with the stored
+  number still showing its old backlog). Status now also audits staleness live,
+  per account, and splits it by how many ~daily cycles each relation has been
+  stale.
+  - That age split is a **diagnostic, not decoration**. When a provider fails a
+    fraction of its requests at random, the chance of the same relation missing
+    N cycles running is `p**N` — so a relation stale for several cycles is very
+    unlikely to be merely unlucky, and is a genuine dead-content candidate (a
+    dropped title, or an `external_series_id` the provider no longer knows).
+    Counting failures alone mixes those two populations together; this
+    separates them.
+- **Durable `last_retry` record**, so a retry is visible in status afterwards
+  rather than only in the action response you happened to be looking at. It is
+  stored separately from `last_sweep`: a retry is a repair, not a trigger, and
+  must not overwrite the sweep's record.
+
+### Changed
+
+- **The retry dispatches worst-stale first** — never-refreshed relations, then
+  oldest. Chunks go out on an increasing countdown, so the longest-suffering
+  relations are attempted earliest and are least likely to be missed if a pass
+  is cut short or the provider degrades partway through.
+- The staleness audit now has a single underlying query feeding both the health
+  summary and the retry set, so the two definitions of "stale" cannot drift
+  apart. Note the granularity: core's refresh task takes series ids, not
+  relation ids, so retrying a stale series re-refreshes that series' other
+  relations on the same account too.
+- Provider error text is stripped of URLs before this plugin logs it.
+  Dispatcharr's own XC errors embed the provider username and password in the
+  failing URL; nothing logged by this plugin copies them.
+
 ## [1.0.1] - 2026-09-15
 
 Hardening only — **no functional change**. Both items close failure modes that

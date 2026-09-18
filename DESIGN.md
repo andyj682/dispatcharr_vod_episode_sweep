@@ -131,6 +131,75 @@ the sweep hour a bit before your client's sync.
   `last_sweep`, so a silently-failing provider is visible rather than leaving
   relations stuck `fetched False` unnoticed.
 
+## Pre-flight provider check and the stale retry (v1.1.0)
+
+Two related additions, both prompted by watching a real provider fail.
+
+**Why a pre-flight check earns its keep.** `refresh_series_episodes`
+authenticates against the provider before *every* series lookup. So when a
+panel is down, a sweep does not fail once — it fails once per relation.
+Observed live: one provider's `player_api.php` returning an error for every
+call produced ~800 failed handshakes in eight minutes, one per watched
+relation, against a server that was already unwell. A single probe per account
+before fanning out replaces all of that with one request.
+
+The probe is **deliberately fail-open**, which is the opposite of how a gate
+normally behaves and is worth stating plainly: it retries, and skips an account
+only if every attempt fails. The asymmetry is the point — wrongly skipping a
+healthy provider costs it a full day of refreshes, whereas wrongly sweeping an
+unhealthy one just repeats what the plugin did before this existed. In doubt,
+sweep.
+
+It therefore catches a **total** outage and not partial degradation. A provider
+failing some fraction of its requests at random will usually pass the probe,
+and should: most of its refreshes will succeed. That case is what the retry
+below is for.
+
+A skip is recorded in `last_sweep.skipped_accounts` *and* logged as a warning,
+because a silently smaller sweep — fewer accounts, a climbing stale count, no
+error anywhere — is the exact failure mode this plugin was built to make
+visible. A mechanism that quietly did less would be indistinguishable from one
+that was working.
+
+**Why retrying only the stale set works.** When a provider fails a fraction of
+requests at random, each pass leaves a *different* slice unrefreshed. Measured
+across three days on one such provider, the sets of failing series overlapped
+only as much as chance predicts — i.e. failures were statistically independent
+between passes. That is what makes a retry worth having: independent failures
+compound, so a second pass clears most of what the first missed, and a third
+most of the remainder. Had the same relations failed every time, retrying would
+have been pointless and the right response would have been to rebuild the
+provider's stored ids instead.
+
+The retry reuses the sweep's chunking and spacing, so it throttles identically,
+and it does not take the daily Redis claim — it is a repair tool, not a
+trigger, and must never suppress the scheduled sweep.
+
+**Staleness age separates two different problems.** Stale relations are not all
+alike, and the distinction is quantitative rather than a matter of taste. If a
+provider fails a proportion `p` of requests independently, the chance of one
+relation missing `N` consecutive cycles is `p**N`. At an observed `p` of around
+0.27 that is ~7% for two cycles and well under 1% for four — so with a backlog
+in the low hundreds you would expect a handful of two-cycle stragglers by
+chance and essentially none at four. A relation stale that long is therefore
+almost certainly *not* unlucky: it is a title the provider dropped, or an
+`external_series_id` it no longer recognises. Retrying it will never help; only
+re-deriving the ids from a fresh listing scan will.
+
+So the plugin reports stale relations bucketed by age in cycles, and the retry
+dispatches the worst first. The bucket counts are the cheap way to tell a
+flaky-panel backlog (nearly all one cycle, membership rotating between passes)
+from genuine dead content (small, persistent, and stuck at high cycle counts) —
+a far sharper separator than the raw failure count, which mixes both.
+
+**Why status audits staleness live.** `last_sweep` is written from an audit
+taken *before* that sweep fanned out, so it describes what the *previous* run
+left behind and is frozen until the next one. A provider can recover, a whole
+backlog can clear, and the stored figure will still show the old number for
+hours. Status therefore reports a live audit alongside the historical record,
+labelled as such — a stored number with no indication of its age is an
+invitation to misdiagnose.
+
 ## Surviving an upstream signature change (v1.0.1)
 
 "Fail-open" is the plugin's core safety property, but it has a precise limit

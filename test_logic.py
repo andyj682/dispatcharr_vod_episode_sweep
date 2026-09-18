@@ -99,6 +99,9 @@ class Env:
         self.schedule_calls = 0
         self.schedule_queue = None  # queue set on the PeriodicTask
         self.redis = {}            # fake Redis store (daily claim keys)
+        self.accounts = []         # [{id, name, server_url}] for the XC probe
+        self.auth_calls = []       # server_urls the pre-flight probe hit
+        self.auth_fail = {}        # server_url -> True (always) | int (n times)
 
 
 ENV = Env()
@@ -323,9 +326,57 @@ def _install_fake_modules():
     class _Types:
         XC = "XC"
 
+    class FakeAccount:
+        """Mirrors the M3UAccount attributes the pre-flight probe reads."""
+
+        def __init__(self, row):
+            self.id = row["id"]
+            self.name = row.get("name", f"acct{row['id']}")
+            self.server_url = row.get("server_url", f"http://p{row['id']}.example")
+            self.username = "user"
+            self.password = "secret"
+
+        def get_user_agent_string(self):
+            return "UA/1.0"
+
+    class AcctManager:
+        def filter(self, id=None, **kw):
+            rows = [r for r in ENV.accounts if id is None or r["id"] == id]
+            return RelQS([FakeAccount(r) for r in rows])
+
     class M3UAccount:
         Types = _Types
+        objects = AcctManager()
     m3u_models.M3UAccount = M3UAccount
+
+    # core.xtream_codes.Client -- only `authenticate()` is exercised, by the
+    # pre-flight reachability probe. Its failure message deliberately mimics
+    # upstream's, which embeds credentials in the URL, so the credential-
+    # stripping test has something realistic to chew on.
+    xc_mod = types.ModuleType("core.xtream_codes")
+
+    class FakeXCClient:
+        def __init__(self, server_url, username, password, user_agent=None):
+            self.server_url = server_url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def authenticate(self):
+            ENV.auth_calls.append(self.server_url)
+            fail = ENV.auth_fail.get(self.server_url)
+            if not fail:
+                return True
+            if fail is not True:
+                ENV.auth_fail[self.server_url] = fail - 1
+            raise RuntimeError(
+                "520 Server Error: <none> for url: "
+                "http://panel.example/player_api.php?username=user&password=secret"
+            )
+    xc_mod.Client = FakeXCClient
 
     vod_tasks = types.ModuleType("apps.vod.tasks")
 
@@ -366,6 +417,18 @@ def _install_fake_modules():
     django_db.transaction = _Transaction()
     django_db.close_old_connections = lambda: None
 
+    # django.utils.timezone -- the staleness code compares relation timestamps
+    # against "now", so an aware UTC clock is enough. Tests that assert on age
+    # pass an explicit `now` rather than relying on this.
+    django_utils = types.ModuleType("django.utils")
+    django_tz = types.ModuleType("django.utils.timezone")
+
+    def _tz_now():
+        from datetime import datetime, timezone as _dtz
+        return datetime.now(_dtz.utc)
+    django_tz.now = _tz_now
+    django_utils.timezone = django_tz
+
     app_init = types.ModuleType("dispatcharr.app_initialization")
     app_init.should_skip_initialization = lambda: True  # import-time: don't schedule
 
@@ -376,6 +439,7 @@ def _install_fake_modules():
     sys.modules["core.utils"] = core_utils
     sys.modules["core.models"] = core_models
     sys.modules["core.scheduling"] = core_sched
+    sys.modules["core.xtream_codes"] = xc_mod
     sys.modules["apps.plugins.models"] = plugins_models
     sys.modules["apps.vod.models"] = vod_models
     sys.modules["apps.m3u.models"] = m3u_models
@@ -383,6 +447,8 @@ def _install_fake_modules():
     sys.modules["apps.output.views"] = output_views
     sys.modules["django"] = types.ModuleType("django")
     sys.modules["django.db"] = django_db
+    sys.modules["django.utils"] = django_utils
+    sys.modules["django.utils.timezone"] = django_tz
     sys.modules["dispatcharr.app_initialization"] = app_init
 
 
@@ -415,6 +481,10 @@ def check(name, cond):
 def reset(**kw):
     global ENV
     ENV = Env()
+    # Accounts the pre-flight probe can look up. Reachable unless a test adds
+    # an ENV.auth_fail entry for the account's server_url.
+    ENV.accounts = [{"id": i, "server_url": f"http://p{i}.example"}
+                    for i in (5, 7, 8, 9)]
     for k, v in kw.items():
         setattr(ENV, k, v)
     patch._ACTIVE = True
@@ -855,6 +925,348 @@ def test_plugin_logger_has_its_own_level():
           logging.getLogger("plugins.dispatcharr_vod_episode_sweep") is patch.logger)
 
 
+def _stub_stale(rows):
+    """Stub the single stale query with explicit rows.
+
+    The fake ORM can't express the real chained `.filter(Q(...)|Q(...))`, and
+    that query is verified by source diff rather than by fakes. What IS worth
+    testing is everything DERIVED from it -- grouping, dedupe, ordering, and
+    which accounts get retried -- so both consumers are driven from one stub.
+    """
+    saved = patch._stale_rows
+    patch._stale_rows = lambda pks, hours=25: list(rows)
+    return saved
+
+
+def test_stale_derivations_share_one_definition():
+    print("test_stale_derivations_share_one_definition")
+    reset()
+    rows = [
+        {"m3u_account_id": 7, "m3u_account__name": "Provider1", "series_id": 100},
+        {"m3u_account_id": 7, "m3u_account__name": "Provider1", "series_id": 100},
+        {"m3u_account_id": 7, "m3u_account__name": "Provider1", "series_id": 200},
+        {"m3u_account_id": 9, "m3u_account__name": "Provider2", "series_id": 100},
+    ]
+    saved = _stub_stale(rows)
+    try:
+        counts = patch._stale_by_account([100, 200])
+        by_acct = patch._stale_series_by_account([100, 200])
+    finally:
+        patch._stale_rows = saved
+    check("counts are per RELATION (duplicates counted)",
+          counts == {"Provider1": 3, "Provider2": 1})
+    check("retry set is per SERIES (duplicates collapsed)",
+          by_acct == {7: [100, 200], 9: [100]})
+    check("retry series ids are sorted", by_acct[7] == sorted(by_acct[7]))
+
+
+def test_preflight_fails_open():
+    print("test_preflight_fails_open")
+    reset()
+    # Transient: fails once, succeeds on the second attempt -> must NOT skip.
+    ENV.auth_fail = {"http://p7.example": 1}
+    check("one-off probe failure still counts as reachable",
+          patch._provider_reachable(7) is True)
+    check("probe retried rather than giving up", len(ENV.auth_calls) == 2)
+
+    # Unknown account id -> cannot probe -> must not block the sweep.
+    reset()
+    check("unknown account is treated as reachable",
+          patch._provider_reachable(999) is True)
+
+
+def test_preflight_skips_only_a_dead_panel():
+    print("test_preflight_skips_only_a_dead_panel")
+    reset()
+    ENV.auth_fail = {"http://p9.example": True}  # fails every attempt
+    check("account failing every attempt is unreachable",
+          patch._provider_reachable(9) is False)
+    check("gave it more than one chance", len(ENV.auth_calls) == 2)
+
+
+def test_sweep_skips_unreachable_account():
+    print("test_sweep_skips_unreachable_account")
+    reset()
+    seed_relations()
+    ENV.auth_fail = {"http://p9.example": True}   # account 9 panel is dead
+    patch._observe(11)  # series 100 -> accounts 7 and 9
+    patch._observe(21)  # series 200 -> account 7
+    summary = patch.run_sweep_impl()
+
+    accounts_enqueued = sorted({a for a, _ in ENV.enqueued})
+    check("dead account gets no refresh tasks", accounts_enqueued == [7])
+    check("healthy account still swept", 7 in accounts_enqueued)
+    check("skip is recorded in the summary", summary["skipped_accounts"] == [9])
+    check("account count reflects only accounts actually swept",
+          summary["accounts"] == 1)
+
+
+def test_retry_stale_targets_only_stale_series():
+    print("test_retry_stale_targets_only_stale_series")
+    reset()
+    seed_relations()
+    patch._observe(11)   # watchlist: series 100
+    patch._observe(21)   # watchlist: series 200
+    # Only series 200 on account 7 is stale.
+    rows = [{"m3u_account_id": 7, "m3u_account__name": "Provider1", "series_id": 200}]
+    saved = _stub_stale(rows)
+    try:
+        summary = patch.retry_stale_impl()
+    finally:
+        patch._stale_rows = saved
+
+    check("only the stale account is dispatched to",
+          sorted({a for a, _ in ENV.enqueued}) == [7])
+    check("only the stale series is retried",
+          [sids for _, sids in ENV.enqueued] == [[200]])
+    check("summary reports the stale relation total", summary["stale_total"] == 1)
+    check("summary breaks stale down per account (a skipped provider keeps its "
+          "backlog, which would otherwise mask progress elsewhere)",
+          summary["stale_by_account"] == {"Provider1": 1})
+    check("summary reports how many series were retried",
+          summary["retried_series"] == 1)
+    check("retry does NOT claim the day (scheduled sweep still runs)",
+          not any(k.startswith(patch.DAILY_PREFIX) for k in ENV.redis))
+
+
+def test_retry_stale_noop_when_clean():
+    print("test_retry_stale_noop_when_clean")
+    reset()
+    seed_relations()
+    patch._observe(11)
+    saved = _stub_stale([])
+    try:
+        summary = patch.retry_stale_impl()
+    finally:
+        patch._stale_rows = saved
+    check("nothing enqueued when nothing is stale", ENV.enqueued == [])
+    check("reports nothing stale", summary["skipped"] == "nothing stale")
+
+
+def test_retry_stale_respects_throttle():
+    print("test_retry_stale_respects_throttle")
+    reset(settings={"sweep_batch_size": 2, "sweep_spacing_seconds": 5})
+    ENV.series = {n: f"S{n}" for n in (100, 101, 102, 103, 104)}
+    ENV.relations = [
+        {"id": n, "series_id": n, "m3u_account_id": 7, "active": True, "xc": True}
+        for n in (100, 101, 102, 103, 104)
+    ]
+    for n in (100, 101, 102, 103, 104):
+        patch.record_series(n)
+    rows = [{"m3u_account_id": 7, "m3u_account__name": "Provider1", "series_id": n}
+            for n in (100, 101, 102, 103, 104)]
+    saved = _stub_stale(rows)
+    try:
+        summary = patch.retry_stale_impl()
+    finally:
+        patch._stale_rows = saved
+    check("retry chunks like the sweep does", summary["tasks"] == 3)
+    check("retry staggers countdowns too", ENV.countdowns == [0, 5, 10])
+
+
+def test_error_text_never_carries_credentials():
+    """Upstream's XC errors embed username/password in the failing URL. Nothing
+    this plugin logs may copy them."""
+    print("test_error_text_never_carries_credentials")
+    reset()
+    exc = RuntimeError(
+        "520 Server Error: <none> for url: "
+        "http://panel.example/player_api.php?username=user&password=secret"
+    )
+    out = patch._safe_err(exc)
+    check("error type preserved", "RuntimeError" in out)
+    check("status text preserved", "520 Server Error" in out)
+    check("URL stripped", "http" not in out)
+    check("username stripped", "username" not in out)
+    check("password stripped", "password" not in out and "secret" not in out)
+
+
+def _aged_row(account_id, name, series_id, hours_ago, now):
+    """A stale row whose relation last refreshed `hours_ago` (None = never)."""
+    from datetime import timedelta
+    return {
+        "m3u_account_id": account_id, "m3u_account__name": name,
+        "series_id": series_id,
+        "last_episode_refresh": None if hours_ago is None else now - timedelta(hours=hours_ago),
+    }
+
+
+def test_stale_age_buckets():
+    """A relation stale for several cycles is very unlikely to be merely
+    unlucky, so the age split separates transient provider flakiness from
+    genuine dead content."""
+    print("test_stale_age_buckets")
+    from datetime import datetime, timezone as _tz
+    reset()
+    now = datetime(2026, 1, 10, 8, 0, 0, tzinfo=_tz.utc)
+    rows = [
+        _aged_row(7, "Provider1", 1, 26, now),    # 1 cycle
+        _aged_row(7, "Provider1", 2, 30, now),    # 1 cycle
+        _aged_row(7, "Provider1", 3, 50, now),    # 2 cycles
+        _aged_row(7, "Provider1", 4, 100, now),   # 3+ cycles
+        _aged_row(7, "Provider1", 5, None, now),  # never refreshed
+    ]
+    buckets = patch._stale_age_buckets(rows, now=now)
+    check("one-cycle stale counted", buckets["1"] == 2)
+    check("two-cycle stale counted", buckets["2"] == 1)
+    check("3+ cycle stale bucketed together", buckets["3+"] == 1)
+    check("never-refreshed tracked separately", buckets["never"] == 1)
+
+
+def test_retry_prioritises_worst_stale_first():
+    print("test_retry_prioritises_worst_stale_first")
+    from datetime import datetime, timezone as _tz
+    reset()
+    now = datetime(2026, 1, 10, 8, 0, 0, tzinfo=_tz.utc)
+    rows = [
+        _aged_row(7, "Provider1", 100, 26, now),    # freshest stale
+        _aged_row(7, "Provider1", 200, 100, now),   # very stale
+        _aged_row(7, "Provider1", 300, None, now),  # never refreshed -> worst
+        _aged_row(7, "Provider1", 400, 50, now),    # middling
+    ]
+    order = patch._stale_series_by_account([100, 200, 300, 400], rows=rows, now=now)[7]
+    check("never-refreshed goes first", order[0] == 300)
+    check("then oldest-to-newest by staleness", order == [300, 200, 400, 100])
+
+    # A series whose WORST relation is ancient ranks by that relation.
+    rows2 = [
+        _aged_row(7, "Provider1", 100, 26, now),
+        _aged_row(7, "Provider1", 100, 200, now),  # same series, much staler
+        _aged_row(7, "Provider1", 200, 50, now),
+    ]
+    order2 = patch._stale_series_by_account([100, 200], rows=rows2, now=now)[7]
+    check("series ranked by its worst relation", order2 == [100, 200])
+
+
+def test_live_stale_summary():
+    print("test_live_stale_summary")
+    from datetime import datetime, timezone as _tz
+    reset()
+    seed_relations()
+    patch._observe(11)
+    now = datetime(2026, 1, 10, 8, 0, 0, tzinfo=_tz.utc)
+    rows = [
+        _aged_row(7, "Provider1", 100, 26, now),
+        _aged_row(9, "Provider2", 100, None, now),
+    ]
+    saved = _stub_stale(rows)
+    try:
+        live = patch.live_stale_summary()
+    finally:
+        patch._stale_rows = saved
+    check("live audit totals relations", live["total"] == 2)
+    check("live audit splits by account",
+          live["by_account"] == {"Provider1": 1, "Provider2": 1})
+    check("live audit includes an age breakdown", sum(live["by_age"].values()) == 2)
+    check("no error recorded on the happy path", live["error"] is None)
+
+
+def test_retry_result_is_persisted():
+    print("test_retry_result_is_persisted")
+    reset()
+    seed_relations()
+    patch._observe(11)
+    rows = [{"m3u_account_id": 7, "m3u_account__name": "Provider1",
+             "series_id": 100, "last_episode_refresh": None}]
+    saved = _stub_stale(rows)
+    try:
+        patch.retry_stale_impl()
+    finally:
+        patch._stale_rows = saved
+    wl = patch.get_watchlist(force=True)
+    check("retry outcome persisted as last_retry", wl.get("last_retry") is not None)
+    check("retry did NOT overwrite the sweep's record", wl.get("last_sweep") is None)
+    check("persisted retry survives a re-read (not dropped by the row parser)",
+          patch.get_watchlist(force=True)["last_retry"]["retried_series"] == 1)
+
+
+def test_run_record_formatting_stays_short():
+    """The UI's action-result box truncates. v1.1.0 first shipped status dumping
+    raw dicts and the message was cut off mid-field, hiding the per-account
+    stale breakdown -- so keep these lines terse and assert it."""
+    print("test_run_record_formatting_stays_short")
+    reset()
+    sweep = {
+        "at": "2026-09-17 08:00:00", "watched": 899, "accounts": 4, "tasks": 116,
+        "pruned": 0, "spread_seconds": 1725, "stale_total": 994,
+        "stale_by_account": {"Provider1": 187, "Provider2": 807},
+        "skipped_accounts": [], "skipped": None,
+    }
+    line = patch.format_run_record("last sweep", sweep)
+    check("record renders on a single line", "\n" not in line)
+    check("record stays well under a truncating UI box", len(line) < 200)
+    check("the per-account breakdown survives",
+          "Provider1 187" in line and "Provider2 807" in line)
+    check("stale total labelled as pre-run", "stale before run 994" in line)
+    check("no raw dict repr leaks in", "{'" not in line)
+
+    retry = {
+        "at": "2026-09-17 23:34:22", "retried_series": 168, "accounts": 1,
+        "tasks": 9, "spread_seconds": 120, "stale_total": 181,
+        "stale_by_account": {"Provider1": 181}, "skipped_accounts": [9],
+        "skipped": None,
+    }
+    rline = patch.format_run_record("last retry", retry)
+    check("retry record reports retried count", "168 retried" in rline)
+    check("unreachable accounts surfaced", "UNREACHABLE [9]" in rline)
+    check("absent record degrades gracefully",
+          patch.format_run_record("last retry", None) == "last retry: none yet")
+
+
+def test_manifest_parity():
+    """plugin.py's Plugin class must match plugin.json.
+
+    This matters more here than it looks: for an ENABLED plugin the loader
+    treats the Plugin CLASS as authoritative for name/description/fields/
+    actions and uses the manifest only as a fallback. So editing plugin.json
+    alone changes nothing in the running UI -- a silent no-op -- and the two
+    files drift apart precisely when someone tweaks wording. Parsed with `ast`
+    rather than imported, because importing plugin.py would run install().
+    """
+    print("test_manifest_parity")
+    import ast
+    import json
+    here = os.path.dirname(os.path.abspath(__file__))
+    manifest = json.load(open(os.path.join(here, "plugin.json"), encoding="utf-8"))
+    tree = ast.parse(open(os.path.join(here, "plugin.py"), encoding="utf-8").read())
+
+    cls = next((n for n in tree.body
+                if isinstance(n, ast.ClassDef) and n.name == "Plugin"), None)
+    check("plugin.py defines a Plugin class", cls is not None)
+    if cls is None:
+        return
+
+    attrs = {}
+    for node in cls.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name):
+                try:
+                    attrs[target.id] = ast.literal_eval(node.value)
+                except Exception:
+                    pass
+
+    check("version matches the manifest",
+          attrs.get("version") == manifest.get("version"))
+    check("field ids match the manifest",
+          [f["id"] for f in attrs.get("fields", [])]
+          == [f["id"] for f in manifest.get("fields", [])])
+
+    py_actions = {a["id"]: a for a in attrs.get("actions", [])}
+    js_actions = {a["id"]: a for a in manifest.get("actions", [])}
+    check("action ids match the manifest",
+          sorted(py_actions) == sorted(js_actions))
+    mismatched = [
+        aid for aid in py_actions
+        if aid in js_actions and any(
+            py_actions[aid].get(k) != js_actions[aid].get(k)
+            for k in ("label", "description", "button_label", "button_variant")
+        )
+    ]
+    check(f"action text/styling identical in both files (drifted: {mismatched})",
+          not mismatched)
+
+
 def test_enqueue_failure_tolerated():
     print("test_enqueue_failure_tolerated")
     reset(delay_raises=True)
@@ -887,6 +1299,20 @@ if __name__ == "__main__":
     test_signature_drift_is_logged_once()
     test_router_call_shape_reaches_the_patch()
     test_plugin_logger_has_its_own_level()
+    test_stale_derivations_share_one_definition()
+    test_preflight_fails_open()
+    test_preflight_skips_only_a_dead_panel()
+    test_sweep_skips_unreachable_account()
+    test_retry_stale_targets_only_stale_series()
+    test_retry_stale_noop_when_clean()
+    test_retry_stale_respects_throttle()
+    test_error_text_never_carries_credentials()
+    test_stale_age_buckets()
+    test_retry_prioritises_worst_stale_first()
+    test_live_stale_summary()
+    test_retry_result_is_persisted()
+    test_run_record_formatting_stays_short()
+    test_manifest_parity()
     test_enqueue_failure_tolerated()
     try:
         os.remove(_scratch)

@@ -102,9 +102,21 @@ list. Only Xtream-Codes VOD series are affected.
 
 ## Actions
 
-- **Show status** — patch active?, schedule, watchlist size, last sweep summary.
+- **Show status** — patch active?, schedule, watchlist size, plus a **live**
+  staleness audit (per account, and split by how many ~daily cycles each
+  relation has been stale) alongside the stored `last_sweep` / `last_retry`
+  records. Note the stored ones are snapshots taken *before* their run fanned
+  out, so they describe the previous cycle; the live figure is what reflects
+  now. Relations stale for 3+ cycles are unlikely to be bad luck — those are
+  the dead-content candidates.
 - **List watched series** — the current watchlist + the path to the debug file.
 - **Run sweep now** — run the sweep inline immediately, ignoring the daily timer.
+- **Retry stale relations** — re-refresh *only* the relations still flagged
+  stale, instead of the whole watchlist. Much cheaper than a full sweep (the
+  stale set is normally a small slice of it), and safe to repeat. Use it after
+  a provider has recovered from an outage, or when a provider fails a fraction
+  of its requests: because those failures are independent, each pass clears
+  most of what the last one missed.
 - **Clear watchlist** — forget everything (it rebuilds as clients sync).
 
 ### Debug file
