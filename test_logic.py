@@ -102,6 +102,7 @@ class Env:
         self.accounts = []         # [{id, name, server_url}] for the XC probe
         self.auth_calls = []       # server_urls the pre-flight probe hit
         self.auth_fail = {}        # server_url -> True (always) | int (n times)
+        self.plugin_tasks = []     # plugin @shared_task dispatches (auto-retry chain)
 
 
 ENV = Env()
@@ -249,10 +250,28 @@ def _install_fake_modules():
     celery_mod = types.ModuleType("celery")
 
     def _fake_shared_task(*dargs, **dkwargs):
+        """Mimic Celery closely enough to test DISPATCH without executing.
+
+        Real @shared_task attaches apply_async/delay to the function; the old
+        stub returned the bare function, so a plugin task's own apply_async did
+        not exist. Recording dispatches (name, args, countdown, queue) is what
+        lets the auto-retry chain be tested -- the queue in particular, since a
+        plugin task on the default prefork queue is silently rejected.
+        """
         def deco(fn):
+            def _apply_async(args=None, kwargs=None, countdown=0, queue=None):
+                ENV.plugin_tasks.append({
+                    "name": dkwargs.get("name"),
+                    "args": list(args or []),
+                    "kwargs": dict(kwargs or {}),
+                    "countdown": countdown,
+                    "queue": queue,
+                })
+            fn.apply_async = _apply_async
+            fn.delay = lambda *a, **k: _apply_async(args=list(a), kwargs=k)
             return fn
         if len(dargs) == 1 and callable(dargs[0]) and not dkwargs:
-            return dargs[0]
+            return deco(dargs[0])
         return deco
     celery_mod.shared_task = _fake_shared_task
     sys.modules["celery"] = celery_mod
@@ -1213,6 +1232,172 @@ def test_run_record_formatting_stays_short():
           patch.format_run_record("last retry", None) == "last retry: none yet")
 
 
+def test_stale_cutoff_uses_last_sweep_time():
+    """The fixed 25h window could not answer "did the last sweep refresh this?".
+
+    With a ~24h cadence a relation that fails at 08:00 is still only ~24.5h
+    past its previous success at 08:33, so it stayed invisible for another day
+    -- which made a retry running shortly after a sweep structurally unable to
+    see the failures it exists to repair. The cutoff is now the sweep's own
+    start time, with the old window kept as a floor.
+    """
+    print("test_stale_cutoff_uses_last_sweep_time")
+    from datetime import datetime, timedelta, timezone as _tz
+    reset()
+    now = datetime(2026, 1, 10, 8, 33, 0, tzinfo=_tz.utc)
+
+    # No sweep recorded yet -> fall back to the fixed window.
+    cut = patch._stale_cutoff(now=now)
+    check("falls back to the fixed window with no recorded sweep",
+          cut == now - timedelta(hours=patch.STALE_HOURS))
+
+    # A sweep 33 minutes ago -> that is the cutoff, NOT now-25h.
+    swept = datetime(2026, 1, 10, 8, 0, 0, tzinfo=_tz.utc)
+    ENV.coresettings[patch.WATCHLIST_CORE_KEY] = {
+        "series": {}, "last_sweep": {"at_epoch": swept.timestamp()},
+    }
+    patch._invalidate_watchlist_cache()
+    cut = patch._stale_cutoff(now=now)
+    check("uses the sweep start once one is recorded", cut == swept)
+    check("a relation last refreshed BEFORE the sweep is now stale",
+          (now - timedelta(hours=24, minutes=30)) < cut)
+    check("a relation refreshed DURING the sweep is not stale",
+          (swept + timedelta(minutes=5)) > cut)
+
+    # A long-stalled sweep must not freeze the metric: the window floor wins.
+    old = datetime(2026, 1, 5, 8, 0, 0, tzinfo=_tz.utc)
+    ENV.coresettings[patch.WATCHLIST_CORE_KEY] = {
+        "series": {}, "last_sweep": {"at_epoch": old.timestamp()},
+    }
+    patch._invalidate_watchlist_cache()
+    cut = patch._stale_cutoff(now=now)
+    check("a stalled sweep falls back to the window so the outage stays visible",
+          cut == now - timedelta(hours=patch.STALE_HOURS))
+
+
+def test_sweep_records_machine_readable_time():
+    print("test_sweep_records_machine_readable_time")
+    reset()
+    seed_relations()
+    patch._observe(11)
+    summary = patch.run_sweep_impl()
+    check("sweep records an epoch alongside the display string",
+          isinstance(summary.get("at_epoch"), float))
+    stored = patch.get_watchlist(force=True)["last_sweep"]
+    check("epoch survives the round-trip through storage",
+          stored.get("at_epoch") == summary["at_epoch"])
+    check("later audits can derive a cutoff from it",
+          patch._last_sweep_epoch() == summary["at_epoch"])
+
+
+def test_auto_retry_config():
+    print("test_auto_retry_config")
+    reset()
+    cfg = patch._load_config(force=True)
+    check("auto-retry defaults on", cfg["auto_retry"] is True)
+    check("default passes is 2", cfg["retry_passes"] == 2)
+
+    reset(settings={"retry_passes": 999})
+    check("passes clamped to the hard ceiling",
+          patch._load_config(force=True)["retry_passes"] == patch.MAX_RETRY_PASSES)
+
+    reset(settings={"retry_passes": -3})
+    check("negative passes clamp to 0",
+          patch._load_config(force=True)["retry_passes"] == 0)
+
+    reset(settings={"auto_retry": False})
+    check("auto-retry can be turned off",
+          patch._load_config(force=True)["auto_retry"] is False)
+
+
+def test_sweep_arms_the_retry_chain():
+    print("test_sweep_arms_the_retry_chain")
+    reset(settings={"retry_passes": 3})
+    seed_relations()
+    patch._observe(11)
+    patch._observe(21)
+    summary = patch.run_sweep_impl()
+
+    chain = [t for t in ENV.plugin_tasks if t["name"] == patch.RETRY_TASK_PATH]
+    check("sweep armed exactly one retry pass", len(chain) == 1)
+    check("chain carries the configured pass count", chain[0]["args"] == [3])
+    check("chain routed to the plugin-capable queue (NOT the prefork default)",
+          chain[0]["queue"] == "dvr")
+    check("chain waits out the sweep's own spread plus a settle margin",
+          chain[0]["countdown"] == summary["spread_seconds"] + patch.RETRY_SETTLE_SECONDS)
+    check("sweep records that a retry was armed",
+          summary["auto_retry_passes"] == 3)
+
+
+def test_sweep_does_not_arm_when_disabled():
+    print("test_sweep_does_not_arm_when_disabled")
+    reset(settings={"auto_retry": False})
+    seed_relations()
+    patch._observe(11)
+    summary = patch.run_sweep_impl()
+    check("no chain armed when auto-retry is off",
+          [t for t in ENV.plugin_tasks if t["name"] == patch.RETRY_TASK_PATH] == [])
+    check("summary reports none armed", summary["auto_retry_passes"] == 0)
+
+    reset(settings={"retry_passes": 0})
+    seed_relations()
+    patch._observe(11)
+    patch.run_sweep_impl()
+    check("passes=0 also means no chain",
+          [t for t in ENV.plugin_tasks if t["name"] == patch.RETRY_TASK_PATH] == [])
+
+
+def test_auto_retry_chain_continues_then_stops():
+    print("test_auto_retry_chain_continues_then_stops")
+    reset()
+    seed_relations()
+    patch._observe(11)
+    rows = [{"m3u_account_id": 7, "m3u_account__name": "Provider1",
+             "series_id": 100, "last_episode_refresh": None}]
+    saved = _stub_stale(rows)
+    try:
+        summary = patch.run_retry(3)   # stale remains -> should chain
+    finally:
+        patch._stale_rows = saved
+    chain = [t for t in ENV.plugin_tasks if t["name"] == patch.RETRY_TASK_PATH]
+    check("still-stale pass schedules the next one", len(chain) == 1)
+    check("pass count decrements", chain[0]["args"] == [2])
+    # The countdown is load-bearing: audit too early and the next pass re-tries
+    # work still in flight, burning the whole chain for nothing.
+    check("next pass waits out this pass's spread plus the settle margin",
+          chain[0]["countdown"]
+          == summary["spread_seconds"] + patch.RETRY_SETTLE_SECONDS)
+    check("chain countdown is never zero",
+          chain[0]["countdown"] >= patch.RETRY_SETTLE_SECONDS)
+    check("chain stays on the plugin-capable queue", chain[0]["queue"] == "dvr")
+    check("trigger records that this was automatic",
+          "auto" in (summary.get("trigger") or ""))
+
+    # Nothing stale -> chain must END, not burn the remaining passes.
+    reset()
+    seed_relations()
+    patch._observe(11)
+    saved = _stub_stale([])
+    try:
+        patch.run_retry(3)
+    finally:
+        patch._stale_rows = saved
+    check("a clean pass ends the chain",
+          [t for t in ENV.plugin_tasks if t["name"] == patch.RETRY_TASK_PATH] == [])
+
+    # Last pass -> no further scheduling even with work outstanding.
+    reset()
+    seed_relations()
+    patch._observe(11)
+    saved = _stub_stale(rows)
+    try:
+        patch.run_retry(1)
+    finally:
+        patch._stale_rows = saved
+    check("final pass does not chain",
+          [t for t in ENV.plugin_tasks if t["name"] == patch.RETRY_TASK_PATH] == [])
+
+
 def test_manifest_parity():
     """plugin.py's Plugin class must match plugin.json.
 
@@ -1312,6 +1497,12 @@ if __name__ == "__main__":
     test_live_stale_summary()
     test_retry_result_is_persisted()
     test_run_record_formatting_stays_short()
+    test_stale_cutoff_uses_last_sweep_time()
+    test_sweep_records_machine_readable_time()
+    test_auto_retry_config()
+    test_sweep_arms_the_retry_chain()
+    test_sweep_does_not_arm_when_disabled()
+    test_auto_retry_chain_continues_then_stops()
     test_manifest_parity()
     test_enqueue_failure_tolerated()
     try:

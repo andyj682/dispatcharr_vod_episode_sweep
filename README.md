@@ -91,6 +91,8 @@ refresh task — so there's no separate Celery/beat setup to worry about.)
 | **Earliest sweep hour (0-23)** | 3 | Hour the daily sweep runs, in **Dispatcharr's configured system timezone** (not the container's UTC clock). With Auto-run daily sweep on, a beat timer fires it at this hour; otherwise it fires on the first client series request at/after it. Set it a bit *before* your client's daily sync. |
 | **Watchlist TTL (days)** | 30 | Forget a series if it hasn't been requested for this long. Keep it comfortably longer than your client's sync interval. |
 | **Auto-run daily sweep** | on | Run the sweep on a fixed daily timer (Celery beat) rather than waiting for client traffic — so it runs *before* your sync and new episodes appear in **one** sync instead of two. Off = opportunistic (traffic-triggered) only. |
+| **Auto-retry stale relations** | on | After each sweep, automatically re-refresh anything still flagged stale — the same work the Retry action does. Useful when a provider intermittently fails requests, since a later pass may succeed where the first didn't. Costs nothing on a clean day: the chain stops as soon as nothing is stale. |
+| **Retry passes** | 2 | How many automatic passes to make. Each one only touches what is still stale, so passes get rapidly cheaper. 0 turns auto-retry off. |
 | **Schedule queue (advanced)** | `dvr` | The Celery queue the scheduled sweep is dispatched to; must be served by a worker that loads plugins (stock Dispatcharr = the threads-pool `dvr` worker). Change only if your worker layout differs. |
 | **Refresh batch size** | 20 | Series per background refresh task — smaller = smaller provider bursts. 0 = one task per account. |
 | **Refresh spacing (seconds)** | 15 | Delay between successive refresh batches (Celery countdown), to spread provider calls. 0 = all at once. |
@@ -167,11 +169,14 @@ Dispatcharr, Celery, or DB required.
    call per relation per account, once per sweep. Scoped to watched series and
    run at most daily — bounded. If a provider rate-limits you, lower **Refresh
    batch size** and/or raise **Refresh spacing** to spread the calls out.
-4. **Provider health.** Each sweep logs a `stale` count — watched relations not
-   episode-refreshed in >25h (see the `[VOD-SWEEP] … not episode-refreshed …`
-   warning and `stale_by_account` in the status/debug output). A persistently
-   high count for one account means that provider is failing `get_series_info`,
-   not the plugin.
+4. **Provider health.** Each sweep logs a `stale` count — watched relations that
+   weren't episode-refreshed since the previous sweep began (see the
+   `[VOD-SWEEP] … not episode-refreshed …` warning and `stale_by_account` in the
+   status/debug output). A persistently high count for one account means that
+   provider is failing `get_series_info`, not the plugin. **Show status** also
+   reports a live count, which is the one that reflects right now — the figures
+   stored in `last sweep` / `last retry` are snapshots taken *before* those runs
+   fanned out.
 5. **Retiring a client-side periodic refresh.** If your generator has its own
    periodic re-fetch, this supersedes it (the generator could only ever hit the
    top relation). Retire it *after* confirming this plugin works live.

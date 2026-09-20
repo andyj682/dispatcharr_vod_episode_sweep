@@ -124,6 +124,10 @@ WATCHLIST_CORE_NAME = "Dispatcharr VOD Episode Sweep - watchlist"
 # QUEUE) -- the prefork default worker's consumer would reject it as unregistered.
 SWEEP_PERIODIC_NAME = "dispatcharr_vod_episode_sweep"
 SWEEP_TASK_PATH = "dispatcharr_vod_episode_sweep.run_sweep"
+# Auto-retry chain. Dispatched with a countdown to the SAME plugin-capable
+# queue as the sweep task -- the prefork default worker's consumer rejects
+# plugin task names outright.
+RETRY_TASK_PATH = "dispatcharr_vod_episode_sweep.run_retry"
 # Dispatcharr's threads-pool worker (single process => its consumer imports
 # plugins via worker_process_init, so it can run a plugin @shared_task).
 DEFAULT_SCHEDULE_QUEUE = "dvr"
@@ -135,6 +139,18 @@ DEFAULT_TTL_DAYS = 30           # drop a watched series after this long unseen
 # tasks out (Celery countdown) so provider get_series_info calls don't burst.
 DEFAULT_BATCH_SIZE = 20         # series per background refresh task (0 = one/account)
 DEFAULT_SPACING_SECONDS = 15.0  # delay added between successive chunk tasks (0 = none)
+
+# Auto-retry: after a sweep, re-attempt whatever is STILL stale, a bounded
+# number of times. Worth doing because provider failures are independent, so
+# each pass clears most of what the last one missed; a pass with nothing stale
+# does nothing and ends the chain.
+DEFAULT_AUTO_RETRY = True
+DEFAULT_RETRY_PASSES = 2
+MAX_RETRY_PASSES = 10           # hard ceiling, whatever the setting says
+# A pass must not audit staleness until the previous pass's tasks have actually
+# RUN, not merely been dispatched -- they carry countdowns up to spread_seconds.
+# This is the margin added on top of that spread before the next pass fires.
+RETRY_SETTLE_SECONDS = 300
 
 # A watched relation not episode-refreshed in this long is flagged as stale
 # (likely a provider error last cycle). Sized just over the daily cadence.
@@ -321,6 +337,15 @@ def _load_config(force: bool = False) -> dict:
     except (TypeError, ValueError):
         spacing = DEFAULT_SPACING_SECONDS
 
+    auto_retry = settings.get("auto_retry", DEFAULT_AUTO_RETRY)
+    auto_retry = (auto_retry if isinstance(auto_retry, bool)
+                  else str(auto_retry).lower() not in ("false", "0", "no", "off", ""))
+    try:
+        retry_passes = int(settings.get("retry_passes", DEFAULT_RETRY_PASSES))
+    except (TypeError, ValueError):
+        retry_passes = DEFAULT_RETRY_PASSES
+    retry_passes = max(0, min(MAX_RETRY_PASSES, retry_passes))
+
     scheduled = settings.get("scheduled_sweep", True)
     scheduled = scheduled if isinstance(scheduled, bool) else str(scheduled).lower() not in ("false", "0", "no", "off", "")
     queue = (settings.get("schedule_queue") or DEFAULT_SCHEDULE_QUEUE)
@@ -333,6 +358,8 @@ def _load_config(force: bool = False) -> dict:
         "spacing_seconds": spacing,
         "scheduled_sweep": scheduled,
         "schedule_queue": queue,
+        "auto_retry": auto_retry,
+        "retry_passes": retry_passes,
     }
     with _cfg_lock:
         _cfg_cache = cfg
@@ -671,6 +698,53 @@ def _safe_err(exc) -> str:
     return f"{type(exc).__name__}: {msg[:80]}" if msg else type(exc).__name__
 
 
+def _last_sweep_epoch():
+    """Unix epoch at which the most recent sweep STARTED, or None."""
+    try:
+        rec = (get_watchlist() or {}).get("last_sweep") or {}
+        val = rec.get("at_epoch")
+        return float(val) if val else None
+    except Exception:
+        return None
+
+
+def _stale_cutoff(hours=STALE_HOURS, now=None):
+    """The moment a relation must have been refreshed after, to count as fresh.
+
+    Takes the LATER of two cutoffs, because each catches something the other
+    misses:
+
+    * **The start of the most recent sweep.** This is the question that
+      actually matters -- "did the last sweep succeed in refreshing this?" --
+      and it is answerable the instant the sweep's tasks finish. A fixed
+      lookback cannot answer it: with a ~24h cadence and a 25h window, a
+      relation that fails this morning is still only ~24.5h past its previous
+      success an hour later, so it stays invisible until the following day.
+      That made a retry running shortly after a sweep structurally unable to
+      see the failures it exists to repair.
+    * **now - hours.** A floor. If sweeps stop running altogether the first
+      cutoff freezes and nothing would ever look stale again; this keeps
+      everything ageing into staleness so a dead sweep stays visible.
+
+    Normal operation uses the sweep time; a stalled sweep falls back to the
+    window.
+    """
+    from datetime import timedelta, timezone as _dt_timezone, datetime
+    from django.utils import timezone as dj_tz
+
+    if now is None:
+        now = dj_tz.now()
+    window = now - timedelta(hours=hours)
+    epoch = _last_sweep_epoch()
+    if not epoch:
+        return window
+    try:
+        swept = datetime.fromtimestamp(float(epoch), _dt_timezone.utc)
+    except Exception:
+        return window
+    return max(window, swept)
+
+
 def _stale_rows(series_pks, hours=STALE_HOURS):
     """Watched relations not episode-refreshed in >hours, as rows of
     (m3u_account_id, m3u_account__name, series_id).
@@ -681,13 +755,11 @@ def _stale_rows(series_pks, hours=STALE_HOURS):
     survives the listing scan's clobbering. A null timestamp counts as stale
     (never refreshed).
     """
-    from datetime import timedelta
     from django.db.models import Q
-    from django.utils import timezone as dj_tz
     from apps.m3u.models import M3UAccount
     from apps.vod.models import M3USeriesRelation
 
-    cutoff = dj_tz.now() - timedelta(hours=hours)
+    cutoff = _stale_cutoff(hours)
     return list(
         M3USeriesRelation.objects.filter(
             series_id__in=series_pks,
@@ -716,12 +788,13 @@ def _stale_age_buckets(rows, now=None):
 
     Why this is worth surfacing: when a provider fails a fraction of its
     requests at RANDOM, the chance of the SAME relation missing N cycles in a
-    row is p**N. At a ~27% failure rate that is ~7% for two cycles and ~0.5%
-    for four. So a relation stale for several cycles is very unlikely to be
-    merely unlucky -- it is a genuine dead-content candidate (a title the
-    provider dropped, or an `external_series_id` it no longer recognises).
-    That separates the two populations far more sharply than counting
-    failures, which mixes them together.
+    row is p**N, which falls away steeply for any plausible p. So a relation
+    stale across several cycles is very unlikely to be merely unlucky -- it is
+    a genuine dead-content candidate (a title the provider dropped, or an
+    `external_series_id` it no longer recognises). That separates the two
+    populations far more sharply than counting failures, which mixes them
+    together. How many cycles counts as suspicious depends on your provider's
+    own failure rate; compare the bucket counts across passes to judge it.
     """
     if now is None:
         from django.utils import timezone as dj_tz
@@ -996,6 +1069,10 @@ def format_run_record(label, rec) -> str:
     bits.append(f"{rec.get('accounts', 0)} acct")
     bits.append(f"{rec.get('tasks', 0)} tasks")
     bits.append(f"~{rec.get('spread_seconds', 0)}s")
+    if rec.get("auto_retry_passes"):
+        bits.append(f"auto-retry armed x{rec['auto_retry_passes']}")
+    if rec.get("trigger"):
+        bits.append(str(rec["trigger"]))
     out = f"{label}: " + " | ".join(bits)
     if rec.get("stale_total") is not None:
         pre = rec.get("stale_by_account") or {}
@@ -1046,9 +1123,13 @@ def run_sweep_impl() -> dict:
 
     summary = {
         "at": _now_local().strftime("%Y-%m-%d %H:%M:%S"),
+        # Machine-readable counterpart to `at`: the staleness cutoff is derived
+        # from this, and parsing the localized display string back would be
+        # both fragile and ambiguous across DST.
+        "at_epoch": time.time(),
         "watched": 0, "accounts": 0, "tasks": 0, "pruned": 0,
         "spread_seconds": 0, "stale_total": 0, "stale_by_account": {},
-        "skipped_accounts": [], "skipped": None,
+        "skipped_accounts": [], "auto_retry_passes": 0, "skipped": None,
     }
     try:
         if not is_enabled():
@@ -1075,9 +1156,10 @@ def run_sweep_impl() -> dict:
             summary["stale_total"] = sum(stale.values())
             if summary["stale_total"]:
                 logger.warning(
-                    "[VOD-SWEEP] %s watched relation(s) not episode-refreshed in "
-                    ">%sh (provider errors last cycle, or not yet swept): %s",
-                    summary["stale_total"], STALE_HOURS, stale,
+                    "[VOD-SWEEP] %s watched relation(s) not episode-refreshed "
+                    "since the previous sweep (provider errors last cycle, or "
+                    "not yet swept): %s",
+                    summary["stale_total"], stale,
                 )
         except Exception:
             logger.debug("[VOD-SWEEP] staleness audit failed (ignored)", exc_info=True)
@@ -1092,6 +1174,20 @@ def run_sweep_impl() -> dict:
         summary["tasks"], summary["spread_seconds"] = _dispatch_refresh(
             by_account, cfg["batch_size"], cfg["spacing_seconds"],
         )
+
+        # Arm the auto-retry chain. It must not audit until this sweep's tasks
+        # have actually RUN -- they carry countdowns up to spread_seconds -- so
+        # the first pass waits out the spread plus a settle margin. Recorded in
+        # the summary so "was a retry armed?" is answerable after the fact
+        # rather than only inferable from logs.
+        if cfg["auto_retry"] and cfg["retry_passes"] >= 1:
+            if schedule_auto_retry(
+                cfg["retry_passes"],
+                summary["spread_seconds"] + RETRY_SETTLE_SECONDS,
+                reason="after sweep",
+            ):
+                summary["auto_retry_passes"] = cfg["retry_passes"]
+
         _record_sweep_result(summary)
         _write_debug_file(last_sweep=summary)
         logger.info(
@@ -1115,7 +1211,75 @@ def run_sweep_impl() -> dict:
 # Stale-retry pass (manual, cheap counterpart to a full sweep)
 # --------------------------------------------------------------------------- #
 
-def retry_stale_impl() -> dict:
+def schedule_auto_retry(passes_left, after_seconds, reason="sweep") -> bool:
+    """Dispatch the next auto-retry pass, `after_seconds` from now.
+
+    Routed to the configured plugin-capable queue: a plugin `@shared_task` sent
+    to the default prefork queue is rejected outright by that worker's consumer
+    ("Received unregistered task"), which is the constraint this plugin has
+    been built around from the start. Fail-open -- if dispatch fails the sweep
+    itself is unaffected and the manual action still exists.
+    """
+    try:
+        passes_left = int(passes_left)
+    except (TypeError, ValueError):
+        return False
+    if passes_left < 1:
+        return False
+    try:
+        cfg = _load_config()
+        queue = cfg["schedule_queue"]
+        countdown = max(0, int(after_seconds))
+        run_retry.apply_async(
+            args=[passes_left], countdown=countdown, queue=queue,
+        )
+        logger.info(
+            "[VOD-SWEEP] auto-retry: %s pass(es) queued after %ss on queue '%s' (%s)",
+            passes_left, countdown, queue, reason,
+        )
+        return True
+    except Exception as exc:
+        logger.warning("[VOD-SWEEP] could not schedule auto-retry: %s", exc)
+        return False
+
+
+@shared_task(name=RETRY_TASK_PATH)
+def run_retry(passes_left=1):
+    """One auto-retry pass, then chain the next if it is still worth doing.
+
+    The chain ends when the passes are used up, or as soon as nothing is stale
+    -- a clean day costs a single audit and no provider calls at all. It keeps
+    going when relations ARE stale but every account was unreachable, since
+    that is precisely the case where waiting and trying again may recover.
+    """
+    try:
+        passes_left = max(0, int(passes_left))
+    except (TypeError, ValueError):
+        passes_left = 0
+
+    summary = retry_stale_impl(trigger=f"auto ({passes_left} pass(es) left)")
+
+    if summary.get("skipped") in ("plugin disabled", "watchlist empty"):
+        return summary
+    if not summary.get("stale_total"):
+        logger.info("[VOD-SWEEP] auto-retry: nothing stale, chain complete")
+        return summary
+    if passes_left > 1:
+        # Wait out this pass's own dispatch spread before auditing again.
+        schedule_auto_retry(
+            passes_left - 1,
+            summary.get("spread_seconds", 0) + RETRY_SETTLE_SECONDS,
+            reason="auto-retry chain",
+        )
+    else:
+        logger.info(
+            "[VOD-SWEEP] auto-retry: passes exhausted, %s relation(s) still stale %s",
+            summary.get("stale_total"), summary.get("stale_by_account"),
+        )
+    return summary
+
+
+def retry_stale_impl(trigger="manual") -> dict:
     """Re-refresh ONLY the relations currently flagged stale.
 
     Why this exists: a provider panel that fails a fraction of its requests at
@@ -1132,6 +1296,7 @@ def retry_stale_impl() -> dict:
 
     summary = {
         "at": _now_local().strftime("%Y-%m-%d %H:%M:%S"),
+        "trigger": trigger,
         "stale_total": 0, "stale_by_account": {}, "stale_by_age": {},
         "retried_series": 0, "accounts": 0, "tasks": 0, "spread_seconds": 0,
         "skipped_accounts": [], "skipped": None,

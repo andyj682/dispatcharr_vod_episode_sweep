@@ -92,6 +92,29 @@ class Plugin:
             ),
         },
         {
+            "id": "auto_retry",
+            "label": "Auto-retry stale relations",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "After each sweep, automatically re-refresh any relations still "
+                "flagged stale -- the same thing the 'Retry stale relations' "
+                "action does. Does nothing when nothing is stale."
+            ),
+        },
+        {
+            "id": "retry_passes",
+            "label": "Retry passes",
+            "type": "number",
+            "default": 2,
+            "help_text": (
+                "How many automatic retry passes to make after a sweep. Each "
+                "pass only touches what is still stale, so passes get rapidly "
+                "cheaper; the chain stops early once nothing is stale. 0 turns "
+                "auto-retry off. Default 2."
+            ),
+        },
+        {
             "id": "watchlist_ttl_days",
             "label": "Watchlist TTL (days)",
             "type": "number",
@@ -235,7 +258,9 @@ class Plugin:
                 "message": (
                     f"active={_patch._ACTIVE} pid={os.getpid()} (one worker; see logs for all)\n"
                     f"sweep {cfg['sweep_hour']:02d}:00 | auto={cfg['scheduled_sweep']} "
-                    f"q={cfg['schedule_queue']} | ttl={cfg['ttl_seconds'] / 86400.0:.0f}d "
+                    f"q={cfg['schedule_queue']} | retry="
+                    + (f"x{cfg['retry_passes']}" if cfg["auto_retry"] and cfg["retry_passes"] else "off")
+                    + f" | ttl={cfg['ttl_seconds'] / 86400.0:.0f}d "
                     f"batch={cfg['batch_size']} space={cfg['spacing_seconds']:.0f}s | "
                     f"watched={len(wl.get('series', {}))}\n\n"
                     f"STALE NOW: {live['total']}"

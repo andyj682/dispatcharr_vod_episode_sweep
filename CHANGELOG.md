@@ -36,6 +36,30 @@ random.
     a warning. A quietly smaller sweep with a climbing stale count and no
     explanation is precisely the silent failure this plugin exists to surface.
 
+- **Auto-retry after each sweep** (`Auto-retry stale relations`, on by default,
+  with a companion `Retry passes`, default 2). After a sweep, the plugin
+  re-attempts whatever is *still* stale — exactly what the manual action does —
+  a bounded number of times.
+  - Worth having because a provider that fails a share of its requests at
+    random fails a **different** share next time. Those failures are
+    independent, so each pass clears most of what the last one missed and the
+    remainder shrinks quickly — a couple of passes turns a partial-failure
+    backlog into a small remainder, for a small fraction of the sweep's own
+    provider calls. How many passes are useful depends on your provider's
+    failure rate; the status action reports the stale count so you can judge
+    it.
+  - Each pass waits out the previous pass's dispatch spread before auditing,
+    because those tasks carry Celery countdowns and staleness means nothing
+    until they have actually run — not merely been dispatched.
+  - **The chain stops as soon as nothing is stale**, so a clean day costs one
+    audit and no provider calls at all. It keeps going when relations are stale
+    but every account was unreachable, since that is the case where waiting and
+    trying again may recover. Passes are hard-capped regardless of the setting.
+  - Like the scheduled sweep, the chain is dispatched to the plugin-capable
+    queue; a plugin task sent to the default prefork worker is rejected
+    outright. Whether a chain was armed is recorded in `last_sweep`, and each
+    pass records its trigger, so "did the auto-retry actually run?" is
+    answerable after the fact instead of only inferable from logs.
 - **Live staleness in "Show status", with an age breakdown.** `last_sweep` is a
   snapshot taken *before* that sweep fanned out, so it can be a day old and
   describe a state that no longer exists — which makes it easy to misread the
@@ -57,6 +81,23 @@ random.
 
 ### Changed
 
+- **"Stale" now means "not refreshed since the last sweep began", not "older
+  than a fixed 25h".** The fixed window could not answer the question that
+  matters — *did the last sweep refresh this?* With a roughly daily cadence a
+  relation that fails at sweep time is still only ~24.5h past its previous
+  success half an hour later, so it stayed invisible for another day. That made
+  the auto-retry structurally unable to see the failures it exists to repair:
+  it would run shortly after the sweep, find nothing, and stop. Caught in live
+  testing, where a sweep left relations unrefreshed and the retry pass
+  correctly reported "nothing stale" half an hour later.
+  - The old window is kept as a **floor** — the cutoff is the later of the two
+    — so that if sweeps stop running altogether everything still ages into
+    staleness and the outage stays visible, instead of the metric freezing.
+  - The sweep now records a machine-readable start time alongside its display
+    timestamp, since parsing a localized string back would be fragile and
+    ambiguous across DST.
+  - ⚠ This changes what the stale numbers mean, so counts from before and
+    after this release are not directly comparable.
 - **The retry dispatches worst-stale first** — never-refreshed relations, then
   oldest. Chunks go out on an increasing countdown, so the longest-suffering
   relations are attempted earliest and are least likely to be missed if a pass

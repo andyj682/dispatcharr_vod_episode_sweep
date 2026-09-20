@@ -122,14 +122,26 @@ the sweep hour a bit before your client's sync.
   Set spacing to 0 to fire everything at once. This only shapes *our* provider
   load; the core `batch_refresh_series_episodes` task still does the work.
 - **Health / failure summary.** Before fanning out, the sweep audits watched
-  relations whose `last_episode_refresh` is older than 25h (or null) — i.e. ones
-  that didn't refresh last cycle — grouped by account. It uses
-  `last_episode_refresh` (a column) rather than the `episodes_fetched` flag,
-  because the listing scan clobbers that flag on the majority of relations while
-  the timestamp survives. A non-zero count logs a `[VOD-SWEEP] … not
-  episode-refreshed in >25h …` warning and is recorded as `stale_by_account` in
-  `last_sweep`, so a silently-failing provider is visible rather than leaving
-  relations stuck `fetched False` unnoticed.
+  relations that have not been episode-refreshed since the previous sweep began
+  (or never), grouped by account. It uses `last_episode_refresh` (a column)
+  rather than the `episodes_fetched` flag, because the listing scan clobbers
+  that flag on the majority of relations while the timestamp survives. A
+  non-zero count logs a `[VOD-SWEEP] … not episode-refreshed since the previous
+  sweep …` warning and is recorded as `stale_by_account` in `last_sweep`, so a
+  silently-failing provider is visible rather than leaving relations stuck
+  `fetched False` unnoticed.
+
+  **Why the cutoff is the sweep time and not a fixed window.** This originally
+  used a fixed 25h lookback, which cannot answer the question that actually
+  matters — *did the last sweep refresh this?* With a roughly daily cadence, a
+  relation that fails at 08:00 is still only ~24.5h past its previous success
+  half an hour later, so it stayed invisible until the next day. That made a
+  retry running shortly after a sweep structurally incapable of seeing the
+  failures it exists to repair: it would audit, find nothing, and stop. The
+  cutoff is now the later of the last sweep's start time and `now − 25h`. The
+  sweep time makes failures visible the moment the sweep's tasks finish; the
+  window is retained as a floor, because if sweeps stop running altogether the
+  first cutoff would freeze and nothing would ever look stale again.
 
 ## Pre-flight provider check and the stale retry (v1.1.0)
 
@@ -175,16 +187,38 @@ The retry reuses the sweep's chunking and spacing, so it throttles identically,
 and it does not take the daily Redis claim — it is a repair tool, not a
 trigger, and must never suppress the scheduled sweep.
 
+**Why the retry is automated, and why it is a chain rather than a loop.** The
+daily sweep will always leave behind whatever share of requests the provider
+happened to fail — every single day, unattended, with nobody watching the
+number. Those relations are episodes a client cannot see for a full cycle,
+which is the precise gap this plugin exists to close, so leaving the repair to
+a human clicking a button only fixes it on days somebody looks.
+
+The timing constraint shapes the implementation. A pass must not audit
+staleness until the *previous* pass's refresh tasks have actually run, and
+those tasks are dispatched with Celery countdowns spread over many minutes. So
+each pass schedules the next with a countdown of that spread plus a settle
+margin, rather than looping or sleeping — a loop would hold a worker thread for
+half an hour, and auditing early would simply re-retry work still in flight.
+
+The chain ends the moment nothing is stale, which makes the common case free:
+on a healthy day the first pass performs one audit, finds nothing, and stops
+without a single provider call. It deliberately does *not* stop when relations
+are stale but every account was unreachable — that is exactly the situation
+where waiting and trying again is the right move. Passes are hard-capped
+independently of the setting so a misconfiguration cannot produce an unbounded
+chain.
+
 **Staleness age separates two different problems.** Stale relations are not all
 alike, and the distinction is quantitative rather than a matter of taste. If a
 provider fails a proportion `p` of requests independently, the chance of one
-relation missing `N` consecutive cycles is `p**N`. At an observed `p` of around
-0.27 that is ~7% for two cycles and well under 1% for four — so with a backlog
-in the low hundreds you would expect a handful of two-cycle stragglers by
-chance and essentially none at four. A relation stale that long is therefore
-almost certainly *not* unlucky: it is a title the provider dropped, or an
-`external_series_id` it no longer recognises. Retrying it will never help; only
-re-deriving the ids from a fresh listing scan will.
+relation missing `N` consecutive cycles is `p**N`, which falls away steeply for
+any plausible `p` — a couple of cycles is uncommon and several is rare. A
+relation stale that long is therefore almost certainly *not* unlucky: it is a
+title the provider dropped, or an `external_series_id` it no longer recognises.
+Retrying it will never help; only re-deriving the ids from a fresh listing scan
+will. Where the cut-off falls depends on your own provider's failure rate,
+which is why the buckets are reported rather than the plugin judging for you.
 
 So the plugin reports stale relations bucketed by age in cycles, and the retry
 dispatches the worst first. The bucket counts are the cheap way to tell a

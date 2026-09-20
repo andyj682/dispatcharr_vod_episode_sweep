@@ -20,6 +20,20 @@
       "help_text": "Automatically run the daily sweep on a timer at the hour above. When off, it still runs -- but only when a client next requests a series after that hour, which lags new episodes by an extra sync. Leave on unless you have a reason not to."
     },
     {
+      "id": "auto_retry",
+      "label": "Auto-retry stale relations",
+      "type": "boolean",
+      "default": true,
+      "help_text": "After each sweep, automatically re-refresh any relations still flagged stale -- the same thing the 'Retry stale relations' action does. Does nothing when nothing is stale."
+    },
+    {
+      "id": "retry_passes",
+      "label": "Retry passes",
+      "type": "number",
+      "default": 2,
+      "help_text": "How many automatic retry passes to make after a sweep. Each pass only touches what is still stale, so passes get rapidly cheaper; the chain stops early once nothing is stale. 0 turns auto-retry off. Default 2."
+    },
+    {
       "id": "watchlist_ttl_days",
       "label": "Watchlist TTL (days)",
       "type": "number",
