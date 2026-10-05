@@ -242,34 +242,17 @@ class Plugin:
             import os
             cfg = _patch._load_config(force=True)
             wl = _patch.get_watchlist(force=True)
-            last = wl.get("last_sweep")
-            last_retry = wl.get("last_retry")
             # `last_sweep` is a snapshot taken BEFORE that sweep fanned out, so
             # it can be a day old and describe a state that no longer exists.
-            # The live audit is what reflects right now.
+            # The live audit is what reflects right now. Message assembly lives
+            # in patch.py so its length can be regression-tested.
             live = _patch.live_stale_summary()
-            by_acct = ", ".join(f"{k} {v}" for k, v in sorted(live["by_account"].items()))
-            age = live.get("by_age") or {}
-            age_str = " ".join(f"{k}={age.get(k, 0)}" for k in ("never", "1", "2", "3+"))
             # Deliberately terse: the UI's result box truncates a long message,
             # and the per-account stale breakdown is the part worth protecting.
             return {
                 "status": "ok",
-                "message": (
-                    f"active={_patch._ACTIVE} pid={os.getpid()} (one worker; see logs for all)\n"
-                    f"sweep {cfg['sweep_hour']:02d}:00 | auto={cfg['scheduled_sweep']} "
-                    f"q={cfg['schedule_queue']} | retry="
-                    + (f"x{cfg['retry_passes']}" if cfg["auto_retry"] and cfg["retry_passes"] else "off")
-                    + f" | ttl={cfg['ttl_seconds'] / 86400.0:.0f}d "
-                    f"batch={cfg['batch_size']} space={cfg['spacing_seconds']:.0f}s | "
-                    f"watched={len(wl.get('series', {}))}\n\n"
-                    f"STALE NOW: {live['total']}"
-                    + (f" ({by_acct})" if by_acct else "")
-                    + f" | age(cycles) {age_str}"
-                    + (f" | audit error: {live['error']}" if live.get("error") else "")
-                    + "\n\n"
-                    + _patch.format_run_record("last sweep", last) + "\n"
-                    + _patch.format_run_record("last retry", last_retry)
+                "message": _patch.build_status_message(
+                    cfg, wl, live, os.getpid(), _patch._ACTIVE,
                 ),
             }
 

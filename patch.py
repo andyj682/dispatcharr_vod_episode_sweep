@@ -156,6 +156,13 @@ RETRY_SETTLE_SECONDS = 300
 # (likely a provider error last cycle). Sized just over the daily cadence.
 STALE_HOURS = 25
 
+# Hard ceiling for the status action's message. The UI's result box clips a
+# long message with no indication, and in practice it twice cut off the
+# per-account stale breakdown -- the one thing worth having during an
+# incident. Stay well inside it, and order the message so anything lost is
+# the least important part.
+STATUS_MAX_CHARS = 700
+
 # In-process: skip re-recording the same series to the DB more than once per
 # this window (bounds writes during a client's burst of get_series_info calls).
 OBSERVE_DEDUPE_SECONDS = 3600.0
@@ -1061,7 +1068,7 @@ def format_run_record(label, rec) -> str:
     """
     if not rec:
         return f"{label}: none yet"
-    bits = [str(rec.get("at", "?"))]
+    bits = [str(rec.get("at", "?"))[:16]]   # minutes are enough here
     if rec.get("watched") is not None:
         bits.append(f"{rec['watched']} watched")
     if rec.get("retried_series") is not None:
@@ -1075,16 +1082,65 @@ def format_run_record(label, rec) -> str:
         bits.append(str(rec["trigger"]))
     out = f"{label}: " + " | ".join(bits)
     if rec.get("stale_total") is not None:
-        pre = rec.get("stale_by_account") or {}
-        flat = ", ".join(f"{k} {v}" for k, v in sorted(pre.items()))
+        # Total only. The per-account split is in the live audit and in the
+        # logs; repeating it here is what made these lines grow with the
+        # number of accounts until the UI clipped them.
         out += f" | stale before run {rec['stale_total']}"
-        if flat:
-            out += f" ({flat})"
     if rec.get("skipped"):
         out += f" | skipped: {rec['skipped']}"
     if rec.get("skipped_accounts"):
         out += f" | UNREACHABLE {rec['skipped_accounts']}"
     return out
+
+
+def build_status_message(cfg, watchlist, live, pid, active) -> str:
+    """Assemble the status action's message.
+
+    This lives here rather than in plugin.py so it can be TESTED. The UI's
+    result box clips a long message silently, and did so twice in practice --
+    both times losing the per-account stale breakdown, which is exactly what
+    you want during an incident. Three things guard against that now:
+
+      * the LIVE audit comes first, so anything clipped is the least useful
+        part rather than the most;
+      * the stored sweep/retry records carry totals only, so their length no
+        longer grows with the number of accounts;
+      * the whole message is capped with a visible marker, so a future
+        overrun announces itself instead of vanishing mid-field.
+    """
+    retry = (f"x{cfg['retry_passes']}"
+             if cfg.get("auto_retry") and cfg.get("retry_passes") else "off")
+    by_acct = ", ".join(
+        f"{k} {v}" for k, v in sorted((live.get("by_account") or {}).items())
+    )
+    age = live.get("by_age") or {}
+    age_str = " ".join(f"{k}={age.get(k, 0)}" for k in ("never", "1", "2", "3+"))
+
+    head = (
+        f"active={active} pid={pid} (one worker; see logs for all)\n"
+        f"sweep {cfg['sweep_hour']:02d}:00 auto={cfg['scheduled_sweep']} "
+        f"q={cfg['schedule_queue']} retry={retry} | "
+        f"batch={cfg['batch_size']} space={cfg['spacing_seconds']:.0f}s "
+        f"ttl={cfg['ttl_seconds'] / 86400.0:.0f}d | "
+        f"watched={len(watchlist.get('series', {}))}"
+    )
+
+    stale = f"STALE NOW {live.get('total', 0)}"
+    if by_acct:
+        stale += f" | {by_acct}"
+    stale += f"\nage(cycles): {age_str}"
+    if live.get("error"):
+        stale += f"\naudit error: {live['error']}"
+
+    body = "\n\n".join([
+        head,
+        stale,
+        format_run_record("last sweep", watchlist.get("last_sweep")),
+        format_run_record("last retry", watchlist.get("last_retry")),
+    ])
+    if len(body) > STATUS_MAX_CHARS:
+        body = body[:STATUS_MAX_CHARS - 4].rstrip() + " ..."
+    return body
 
 
 def live_stale_summary() -> dict:

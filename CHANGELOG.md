@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.0] - 2026-09-17
+## [1.1.0] - 2026-10-05
 
 Adds a targeted retry, and stops the sweep hammering a provider whose API is
 down. Both come out of a live diagnosis where one provider's panel was
@@ -78,6 +78,12 @@ random.
   rather than only in the action response you happened to be looking at. It is
   stored separately from `last_sweep`: a retry is a repair, not a trigger, and
   must not overwrite the sweep's record.
+  - The status message is kept deliberately compact, because the UI's result
+    box clips a long one with no indication. The live audit comes first, the
+    stored sweep/retry records carry totals only so their length does not grow
+    with the number of accounts, and the whole message is capped with a visible
+    marker so a future overrun announces itself instead of disappearing
+    mid-field.
 
 ### Changed
 

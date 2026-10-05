@@ -1214,9 +1214,10 @@ def test_run_record_formatting_stays_short():
     line = patch.format_run_record("last sweep", sweep)
     check("record renders on a single line", "\n" not in line)
     check("record stays well under a truncating UI box", len(line) < 200)
-    check("the per-account breakdown survives",
-          "Provider1 187" in line and "Provider2 807" in line)
     check("stale total labelled as pre-run", "stale before run 994" in line)
+    check("per-account split NOT repeated here (it is in the live audit, and "
+          "repeating it grew these lines until the UI clipped them)",
+          "Provider1 187" not in line and "Provider2 807" not in line)
     check("no raw dict repr leaks in", "{'" not in line)
 
     retry = {
@@ -1398,6 +1399,56 @@ def test_auto_retry_chain_continues_then_stops():
           [t for t in ENV.plugin_tasks if t["name"] == patch.RETRY_TASK_PATH] == [])
 
 
+def test_status_message_fits_the_ui_box():
+    """The UI's result box clips a long message with no indication -- it did so
+    twice in practice, both times losing the per-account stale breakdown, which
+    is the thing you actually need during an incident. The earlier guard only
+    measured ONE record line in isolation, so it never saw the assembled
+    message grow with the number of accounts. Measure the whole thing."""
+    print("test_status_message_fits_the_ui_box")
+    reset()
+    names = ["Provider%d" % i for i in range(1, 9)]
+    live = {
+        "total": 1234,
+        "by_account": {n: 150 + i for i, n in enumerate(names)},
+        "by_age": {"never": 4, "1": 57, "2": 846, "3+": 12},
+        "error": None,
+    }
+    cfg = patch._load_config(force=True)
+    wl = {
+        "series": {str(i): 0 for i in range(900)},
+        "last_sweep": {
+            "at": "2026-10-05 08:00:00", "watched": 895, "accounts": 8,
+            "tasks": 116, "spread_seconds": 1725, "stale_total": 911,
+            "stale_by_account": {n: 100 for n in names},
+            "auto_retry_passes": 2, "skipped_accounts": [], "skipped": None,
+        },
+        "last_retry": {
+            "at": "2026-10-05 12:26:57", "retried_series": 683, "accounts": 8,
+            "tasks": 35, "spread_seconds": 510, "stale_total": 907,
+            "stale_by_account": {n: 100 for n in names},
+            "trigger": "manual", "skipped_accounts": [], "skipped": None,
+        },
+    }
+    msg = patch.build_status_message(cfg, wl, live, 273, True)
+    check("whole message fits the budget (len=%d)" % len(msg),
+          len(msg) <= patch.STATUS_MAX_CHARS)
+    check("message was not clipped", not msg.endswith(" ..."))
+    check("every account survives in the live breakdown",
+          all(n in msg for n in names))
+    check("live audit comes before the stored records",
+          msg.index("STALE NOW") < msg.index("last sweep"))
+    check("age buckets present", "age(cycles)" in msg)
+    check("stored records do not repeat the per-account split",
+          msg.count("Provider1 ") == 1)
+
+    # An overrun must announce itself rather than vanish mid-field.
+    live["by_account"] = {("VeryLongProviderName%02d" % i): 999 for i in range(40)}
+    long_msg = patch.build_status_message(cfg, wl, live, 273, True)
+    check("an overrun is capped", len(long_msg) <= patch.STATUS_MAX_CHARS)
+    check("and is marked as truncated", long_msg.endswith(" ..."))
+
+
 def test_manifest_parity():
     """plugin.py's Plugin class must match plugin.json.
 
@@ -1497,6 +1548,7 @@ if __name__ == "__main__":
     test_live_stale_summary()
     test_retry_result_is_persisted()
     test_run_record_formatting_stays_short()
+    test_status_message_fits_the_ui_box()
     test_stale_cutoff_uses_last_sweep_time()
     test_sweep_records_machine_readable_time()
     test_auto_retry_config()
