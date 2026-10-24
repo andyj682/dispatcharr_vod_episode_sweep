@@ -59,6 +59,47 @@ you'd worry about:
 The only requirement is a TTL longer than the client's sync interval; the default
 is **30 days**, which ages out only series that are genuinely no longer synced.
 
+### What the XC `series_id` means depends on the release (v1.1.1)
+
+Up to Dispatcharr 0.32.0, both `get_series` and `get_series_info` use the
+`M3USeriesRelation` PK as the XC `series_id`, so the plugin translates it to its
+Series. From 0.33.0 both use the **Series** PK, so the plugin only checks that
+the series has an active relation.
+
+Getting this wrong is silent, not a miss: relation PKs and Series PKs are
+separate auto-increment ranges that overlap, so the old lookup on a new id
+usually finds *some* relation, belonging to an unrelated series. That series
+is what got watched, and the one the client synced aged out after the TTL.
+
+There is no version API, so the release is **feature-detected**, once per
+process: `Series` has a `language` field from 0.33.0, which shipped in the
+same release as the id change. That is a proxy, not a cause, so a compat check
+should confirm the two still travel together. Two deliberate choices:
+
+- **No "try both" fallback.** An integer valid both ways would resolve to the
+  wrong series in exactly the overlapping cases.
+- **Unknown means observe nothing.** If the model can't be inspected, nothing
+  is recorded, and detection is retried on the next call rather than cached.
+  Missing a few observations is harmless; recording the wrong series is not.
+
+`Show status` prints the detected mode (`xc_ids=series|relation|?`).
+
+### Schedule ownership on stop (v1.1.1)
+
+`Plugin.stop()` receives the reason in its context (`disable`, `delete`,
+`reload`, on 0.32.0 and 0.33.0 alike) and only deletes the beat row where
+nothing else would bring it back or remove it:
+
+| reason  | row | why |
+|---|---|---|
+| `delete`  | removed | 0.32.0 core leaves plugin rows behind |
+| `reload`  | kept | the re-import recreates it in only one uWSGI worker, so deleting it could leave no schedule until a restart |
+| `disable` | kept on 0.33.0+, removed before | 0.33.0 core suspends and restores plugin schedules itself (detected via `PluginConfig.suspended_schedules`); deleting would leave it nothing to restore |
+| other     | removed | the pre-1.1.1 behavior |
+
+A kept row firing while the plugin is disabled is harmless: `run_sweep_impl`
+checks the enabled flag first and no-ops.
+
 ## Triggering — two paths, deduped by a shared daily claim
 
 The prefork-worker constraint (learned the hard way, verified live): Dispatcharr's
@@ -161,6 +202,14 @@ only if every attempt fails. The asymmetry is the point — wrongly skipping a
 healthy provider costs it a full day of refreshes, whereas wrongly sweeping an
 unhealthy one just repeats what the plugin did before this existed. In doubt,
 sweep.
+
+From v1.1.1 that includes a **code-level** error in the probe itself. A
+`TypeError` or `AttributeError` means core's XC client or account API changed
+(a renamed method, a new constructor argument), not that a panel is down;
+counting it as "down" would skip *every* account and dispatch nothing, without
+a word. Such an error now counts as "can't probe" → reachable, with one warning
+per process naming it so the drift is still visible. Network and HTTP errors
+remain the only things that count as down.
 
 It therefore catches a **total** outage and not partial degradation. A provider
 failing some fraction of its requests at random will usually pass the probe,

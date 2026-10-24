@@ -187,6 +187,12 @@ _extra_args_logged = False
 
 _pid_logged = set()
 
+# What core's XC series_id means on this release; see _xc_series_id_mode.
+_series_id_mode = None
+
+# One-shot flag: the pre-flight hit a code-level error (see _provider_reachable).
+_probe_code_error_logged = False
+
 _observe_lock = threading.Lock()
 _recent_observed = {}           # series_id-input -> monotonic deadline
 
@@ -512,12 +518,65 @@ def clear_watchlist() -> int:
 # Observation: wrap xc_get_series_info
 # --------------------------------------------------------------------------- #
 
+def _model_has_field(model, name):
+    """True/False if `model` declares field `name`; None if that can't be told."""
+    try:
+        return any(f.name == name for f in model._meta.get_fields())
+    except Exception:
+        return None
+
+
+def _xc_series_id_mode():
+    """What core's XC `series_id` refers to: "series" or "relation" (None = unknown).
+
+    Dispatcharr 0.33.0 changed the meaning in both XC endpoints at once:
+    `get_series` now advertises the Series PK and `get_series_info` looks it up
+    by `series_id`; up to 0.32.0 both used the M3USeriesRelation PK. There is
+    no version API, so this is feature-detected. The marker is a PROXY: the
+    per-language `Series.language` field shipped in the same release as the id
+    change. It is not causally tied to it, so re-check it if a release ever
+    changes one without the other.
+
+    Deliberately no "try both" fallback: the two id ranges overlap, so an
+    integer that is valid both ways would silently resolve to the wrong series
+    in exactly the cases that matter.
+    """
+    global _series_id_mode
+    if _series_id_mode is not None:
+        return _series_id_mode
+    try:
+        from apps.vod.models import Series
+    except Exception:
+        return None
+    has_language = _model_has_field(Series, "language")
+    if has_language is None:
+        return None  # don't cache an unknown -- try again on the next call
+    _series_id_mode = "series" if has_language else "relation"
+    logger.info(
+        "[VOD-SWEEP] XC series_id = %s id on this Dispatcharr release",
+        "Series" if _series_id_mode == "series" else "M3USeriesRelation",
+    )
+    return _series_id_mode
+
+
 def _resolve_series_pk(series_id):
-    """series_id (an M3USeriesRelation.id) -> Series PK, for an active relation."""
+    """XC series_id -> Series PK, for a series with an active relation.
+
+    0.33.0+: the id already IS the Series PK, so it is validated, not
+    translated. Up to 0.32.0: it is a relation PK, translated to its Series.
+    Unknown mode -> None (observe nothing rather than risk the wrong series).
+    """
     from apps.vod.models import M3USeriesRelation
+    mode = _xc_series_id_mode()
+    if mode == "series":
+        lookup = {"series_id": series_id}
+    elif mode == "relation":
+        lookup = {"id": series_id}
+    else:
+        return None
     return (
         M3USeriesRelation.objects
-        .filter(id=series_id, m3u_account__is_active=True)
+        .filter(m3u_account__is_active=True, **lookup)
         .values_list("series_id", flat=True)
         .first()
     )
@@ -894,6 +953,7 @@ def _provider_reachable(account_id, attempts=2) -> bool:
     except Exception:
         return True
 
+    global _probe_code_error_logged
     last = None
     for _ in range(max(1, int(attempts))):
         try:
@@ -904,6 +964,23 @@ def _provider_reachable(account_id, attempts=2) -> bool:
                 account.get_user_agent_string(),
             ) as client:
                 client.authenticate()
+            return True
+        except (TypeError, AttributeError) as exc:
+            # A code-level error means core's client or account API changed
+            # (renamed method, new constructor signature), not that the panel
+            # is down. Counting it as "down" would skip EVERY account and
+            # dispatch nothing, silently -- the one way this probe could fail
+            # closed. So fail open, and leave one warning naming the error so
+            # the API drift is still visible to a compat check.
+            if not _probe_code_error_logged:
+                _probe_code_error_logged = True
+                logger.warning(
+                    "[VOD-SWEEP] pre-flight could not probe providers (%s); "
+                    "skipping the check rather than the accounts -- core's XC "
+                    "client API has likely changed, re-check this plugin "
+                    "against the current Dispatcharr release.",
+                    _safe_err(exc),
+                )
             return True
         except Exception as exc:
             last = exc
@@ -1093,7 +1170,7 @@ def format_run_record(label, rec) -> str:
     return out
 
 
-def build_status_message(cfg, watchlist, live, pid, active) -> str:
+def build_status_message(cfg, watchlist, live, pid, active, id_mode=None) -> str:
     """Assemble the status action's message.
 
     This lives here rather than in plugin.py so it can be TESTED. The UI's
@@ -1117,7 +1194,8 @@ def build_status_message(cfg, watchlist, live, pid, active) -> str:
     age_str = " ".join(f"{k}={age.get(k, 0)}" for k in ("never", "1", "2", "3+"))
 
     head = (
-        f"active={active} pid={pid} (one worker; see logs for all)\n"
+        f"active={active} pid={pid} xc_ids={id_mode or '?'} "
+        f"(one worker; see logs for all)\n"
         f"sweep {cfg['sweep_hour']:02d}:00 auto={cfg['scheduled_sweep']} "
         f"q={cfg['schedule_queue']} retry={retry} | "
         f"batch={cfg['batch_size']} space={cfg['spacing_seconds']:.0f}s "
@@ -1531,6 +1609,46 @@ def install(manage_schedule=None) -> bool:
         logger.debug("[VOD-SWEEP] schedule setup skipped", exc_info=True)
 
     return True
+
+
+def _core_manages_schedules():
+    """True if core suspends/restores plugin schedules itself (0.33.0+).
+
+    Detected by PluginConfig.suspended_schedules, the field that feature
+    stores its state in. None if it can't be told.
+    """
+    try:
+        from apps.plugins.models import PluginConfig
+    except Exception:
+        return None
+    return _model_has_field(PluginConfig, "suspended_schedules")
+
+
+def stop_for_reason(reason=None) -> bool:
+    """Plugin.stop(): revert the patch, and decide whether the schedule row goes.
+
+    Core passes the reason in the stop context ("disable", "delete", "reload").
+    The row is deleted only where nothing else would bring it back or remove it:
+
+      * delete  -> always remove (on 0.32.0 nothing else would).
+      * reload  -> keep. Reload stops every plugin and re-imports it, and the
+                   import only recreates the row in ONE web worker -- so
+                   deleting here could leave no daily schedule until a restart.
+      * disable -> keep where core suspends and restores plugin schedules
+                   (0.33.0+): deleting would leave it nothing to restore.
+                   Older releases: remove, as before.
+      * unknown -> remove, the pre-1.1.1 behavior.
+
+    A kept row firing while the plugin is disabled is harmless: the sweep
+    checks the enabled flag first and no-ops.
+    """
+    if reason == "reload":
+        keep = True
+    elif reason == "disable":
+        keep = bool(_core_manages_schedules())
+    else:
+        keep = False
+    return uninstall(remove_sched=not keep)
 
 
 def uninstall(remove_sched: bool = True) -> bool:

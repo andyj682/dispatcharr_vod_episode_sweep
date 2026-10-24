@@ -103,6 +103,12 @@ class Env:
         self.auth_calls = []       # server_urls the pre-flight probe hit
         self.auth_fail = {}        # server_url -> True (always) | int (n times)
         self.plugin_tasks = []     # plugin @shared_task dispatches (auto-retry chain)
+        # Release shape. False/False = 0.32.0 (XC series_id is a relation PK,
+        # stop() owns schedule cleanup); True/True = 0.33.0. None = the model
+        # has no readable _meta, so the release can't be told.
+        self.series_has_language = False
+        self.core_suspends_schedules = False
+        self.auth_raise = None     # exception class the probe raises instead
 
 
 ENV = Env()
@@ -141,19 +147,21 @@ class RelQS:
 
 
 class RelManager:
-    def filter(self, id=None, series_id__in=None, m3u_account__is_active=None,
-               m3u_account__account_type=None, **kw):
+    def filter(self, id=None, series_id=None, series_id__in=None,
+               m3u_account__is_active=None, m3u_account__account_type=None, **kw):
         rows = list(ENV.relations)
-        if id is not None:
-            # Django coerces a string PK lookup to int on an integer field, and
-            # the XC router hands series_id straight from the query string
-            # (`request.GET.get("series_id")`), so it IS a string in production.
-            # Coerce here or the fake would be more forgiving than the real ORM.
+        # Django coerces a string lookup to int on an integer field, and the
+        # XC router hands series_id straight from the query string
+        # (`request.GET.get("series_id")`), so it IS a string in production.
+        # Coerce here or the fake would be more forgiving than the real ORM.
+        for field, val in (("id", id), ("series_id", series_id)):
+            if val is None:
+                continue
             try:
-                id = int(id)
+                val = int(val)
             except (TypeError, ValueError):
                 return RelQS([])
-            rows = [r for r in rows if r["id"] == id]
+            rows = [r for r in rows if r[field] == val]
         if series_id__in is not None:
             rows = [r for r in rows if r["series_id"] in series_id__in]
         if m3u_account__is_active:
@@ -324,10 +332,33 @@ def _install_fake_modules():
     core_sched.create_or_update_periodic_task = create_or_update_periodic_task
     core_sched.delete_periodic_task = delete_periodic_task
 
+    class _Field:
+        def __init__(self, name):
+            self.name = name
+
+    class _Meta:
+        """Model._meta.get_fields(), with one optional field toggled by ENV.
+
+        This is how the plugin tells releases apart, so each fake model carries
+        the field that marks the newer release only when the scenario says so.
+        """
+
+        def __init__(self, base, optional, env_attr):
+            self.base, self.optional, self.env_attr = base, optional, env_attr
+
+        def get_fields(self):
+            flag = getattr(ENV, self.env_attr)
+            if flag is None:
+                raise RuntimeError("model meta unavailable")
+            names = list(self.base) + ([self.optional] if flag else [])
+            return [_Field(n) for n in names]
+
     plugins_models = types.ModuleType("apps.plugins.models")
 
     class PluginConfig:
         objects = PCManager()
+        _meta = _Meta(("key", "enabled", "settings"), "suspended_schedules",
+                      "core_suspends_schedules")
     plugins_models.PluginConfig = PluginConfig
 
     vod_models = types.ModuleType("apps.vod.models")
@@ -337,6 +368,7 @@ def _install_fake_modules():
 
     class Series:
         objects = SeriesManager()
+        _meta = _Meta(("id", "name", "tmdb_id"), "language", "series_has_language")
     vod_models.M3USeriesRelation = M3USeriesRelation
     vod_models.Series = Series
 
@@ -386,6 +418,8 @@ def _install_fake_modules():
 
         def authenticate(self):
             ENV.auth_calls.append(self.server_url)
+            if ENV.auth_raise is not None:
+                raise ENV.auth_raise("simulated core API change")
             fail = ENV.auth_fail.get(self.server_url)
             if not fail:
                 return True
@@ -513,6 +547,8 @@ def reset(**kw):
         patch._recent_observed.clear()
     patch._daily_checked_date = None
     patch._ip_daily_date = None
+    patch._series_id_mode = None
+    patch._probe_code_error_logged = False
     patch._invalidate_tz_cache()
     CLOCK.set_hour(12)
     # restore native handler each scenario
@@ -1430,7 +1466,7 @@ def test_status_message_fits_the_ui_box():
             "trigger": "manual", "skipped_accounts": [], "skipped": None,
         },
     }
-    msg = patch.build_status_message(cfg, wl, live, 273, True)
+    msg = patch.build_status_message(cfg, wl, live, 273, True, id_mode="relation")
     check("whole message fits the budget (len=%d)" % len(msg),
           len(msg) <= patch.STATUS_MAX_CHARS)
     check("message was not clipped", not msg.endswith(" ..."))
@@ -1503,6 +1539,232 @@ def test_manifest_parity():
           not mismatched)
 
 
+class captured_warnings:
+    """Collect the plugin logger's WARNING+ messages for the duration."""
+
+    def __enter__(self):
+        self.messages = []
+        outer = self
+
+        class _H(logging.Handler):
+            def emit(self, record):
+                if record.levelno >= logging.WARNING:
+                    outer.messages.append(record.getMessage())
+        self._h = _H()
+        self._saved_propagate = patch.logger.propagate
+        patch.logger.addHandler(self._h)
+        patch.logger.propagate = False   # keep expected warnings off the console
+        return self
+
+    def __exit__(self, *exc):
+        patch.logger.removeHandler(self._h)
+        patch.logger.propagate = self._saved_propagate
+        return False
+
+
+def seed_overlapping_ids():
+    """Relation PKs and Series PKs are independent auto-increment ranges, so
+    the same integer is routinely valid as both. That overlap is what makes a
+    wrong-meaning lookup SILENT rather than a miss, so the fixture builds it in:
+
+      Series 100 ("Show A")  <- relations 11 (acct 7), 12 (acct 9)
+      Series 555 ("Show C")  <- relation 100 (acct 7)   <- id 100 again
+      Series 300 ("Show D")  <- relation 31 on an INACTIVE account only
+    """
+    ENV.series = {100: "Show A", 555: "Show C", 300: "Show D"}
+    ENV.relations = [
+        {"id": 11, "series_id": 100, "m3u_account_id": 7, "active": True, "xc": True},
+        {"id": 12, "series_id": 100, "m3u_account_id": 9, "active": True, "xc": True},
+        {"id": 100, "series_id": 555, "m3u_account_id": 7, "active": True, "xc": True},
+        {"id": 31, "series_id": 300, "m3u_account_id": 8, "active": False, "xc": True},
+    ]
+
+
+def test_series_id_mode_detection():
+    print("test_series_id_mode_detection")
+    reset(series_has_language=False)
+    check("0.32.0 shape (no Series.language) -> relation ids",
+          patch._xc_series_id_mode() == "relation")
+
+    reset(series_has_language=True)
+    check("0.33.0 shape (Series.language) -> Series ids",
+          patch._xc_series_id_mode() == "series")
+    ENV.series_has_language = False
+    check("mode is cached once detected (no per-request introspection)",
+          patch._xc_series_id_mode() == "series")
+
+    reset(series_has_language=None)
+    seed_overlapping_ids()
+    check("unreadable model meta -> mode unknown",
+          patch._xc_series_id_mode() is None)
+    patch._observe("100")
+    check("unknown mode observes NOTHING rather than guessing",
+          patch.get_watchlist(force=True)["series"] == {})
+    ENV.series_has_language = True
+    check("an unknown mode is not cached -- detection retries",
+          patch._xc_series_id_mode() == "series")
+
+
+def test_v033_series_id_is_the_series_pk():
+    """The 0.33.0 break: the XC id is now a Series PK. With overlapping ids the
+    old relation-PK lookup does not miss -- it records the WRONG series."""
+    print("test_v033_series_id_is_the_series_pk")
+    reset(series_has_language=True)
+    seed_overlapping_ids()
+    with stubbed_tick():
+        patch._observe("100")   # string, as the XC router passes it
+    wl = patch.get_watchlist(force=True)["series"]
+    check("id 100 is recorded as Series 100 (the series the client asked for)",
+          "100" in wl)
+    check("NOT as Series 555, whose relation happens to have PK 100",
+          "555" not in wl)
+
+    patch._observe("300")
+    check("a Series with no ACTIVE relation is not recorded",
+          "300" not in patch.get_watchlist(force=True)["series"])
+    patch._observe("999")
+    check("an unknown Series id is not recorded",
+          "999" not in patch.get_watchlist(force=True)["series"])
+    patch._observe("abc")
+    check("a non-numeric id is ignored, not raised",
+          len(patch.get_watchlist(force=True)["series"]) == 1)
+
+    patch.run_sweep_impl()
+    by_acct = {a: sids for a, sids in ENV.enqueued}
+    check("the sweep refreshes the RIGHT series on every relation",
+          by_acct == {7: [100], 9: [100]})
+
+
+def test_v032_series_id_is_still_a_relation_pk():
+    print("test_v032_series_id_is_still_a_relation_pk")
+    reset(series_has_language=False)
+    seed_overlapping_ids()
+    patch._observe("100")
+    wl = patch.get_watchlist(force=True)["series"]
+    check("on 0.32.0, id 100 is relation 100 -> Series 555", "555" in wl)
+    check("and not Series 100", "100" not in wl)
+    patch._observe("11")
+    check("relation 11 -> Series 100, unchanged from 1.1.0",
+          "100" in patch.get_watchlist(force=True)["series"])
+
+
+def test_stop_keeps_the_schedule_where_it_should():
+    print("test_stop_keeps_the_schedule_where_it_should")
+    cases = [
+        # (reason, core suspends schedules?, row removed?)
+        ("delete", False, True),
+        ("delete", True, True),
+        ("reload", False, False),
+        ("reload", True, False),
+        ("disable", True, False),   # 0.33.0: core suspends + restores it
+        ("disable", False, True),   # 0.32.0: nothing would, so remove it
+        ("disable", None, True),    # can't tell -> the old behavior
+        (None, True, True),         # no reason given -> the old behavior
+    ]
+    for reason, suspends, removed in cases:
+        reset(core_suspends_schedules=suspends)
+        patch.install(manage_schedule=False)
+        patch.stop_for_reason(reason)
+        check(f"stop(reason={reason!r}, core suspends={suspends}) "
+              f"{'removes' if removed else 'keeps'} the schedule row",
+              (ENV.delete_calls == 1) == removed)
+        check(f"  ...and reverts the patch either way",
+              patch._ACTIVE is False and
+              sys.modules["apps.output.views"].xc_get_series_info
+              is not patch.patched_xc_get_series_info)
+
+
+def test_plugin_stop_passes_the_reason():
+    """plugin.py can't be imported here (import runs install()), so check
+    statically that stop() routes through the reason-aware helper."""
+    print("test_plugin_stop_passes_the_reason")
+    import ast
+    tree = ast.parse(open(os.path.join(_here, "plugin.py"), encoding="utf-8").read())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Plugin")
+    stop = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "stop")
+    src = ast.unparse(stop)
+    check("Plugin.stop calls stop_for_reason", "stop_for_reason(" in src)
+    check("Plugin.stop reads context['reason']", "'reason'" in src)
+    check("Plugin.stop no longer calls uninstall() directly", "uninstall(" not in src)
+
+
+def test_preflight_fails_open_on_code_errors():
+    print("test_preflight_fails_open_on_code_errors")
+    for exc in (TypeError, AttributeError):
+        reset(auth_raise=exc)
+        with captured_warnings() as cap:
+            ok = patch._provider_reachable(7)
+            patch._provider_reachable(9)
+        check(f"{exc.__name__} in the probe counts as reachable", ok is True)
+        check(f"  ...and leaves exactly one warning naming it",
+              len(cap.messages) == 1 and exc.__name__ in cap.messages[0])
+
+    reset(auth_raise=TypeError)
+    seed_relations()
+    patch._observe(11)
+    patch._observe(21)
+    with captured_warnings():
+        summary = patch.run_sweep_impl()
+    check("a core API change does not skip every account",
+          summary["skipped_accounts"] == [] and summary["tasks"] == 2)
+
+    reset(auth_raise=ConnectionError)
+    with captured_warnings():
+        down = patch._provider_reachable(7)
+    check("a network error still counts as down", down is False)
+
+
+def test_import_time_schedule_follows_should_skip():
+    """Dispatcharr 0.32.0+ returns False from should_skip_initialization() in
+    one uWSGI worker per boot, so this import-time branch runs in production."""
+    print("test_import_time_schedule_follows_should_skip")
+    app_init = sys.modules["dispatcharr.app_initialization"]
+    saved = app_init.should_skip_initialization
+    try:
+        app_init.should_skip_initialization = lambda: False
+        reset(settings={"sweep_hour": 6})
+        patch.install()
+        check("the initializing worker creates the schedule",
+              ENV.schedule_calls == 1 and ENV.delete_calls == 0)
+        check("  ...at the configured hour, on the dvr queue",
+              ENV.schedule["cron_expression"] == "0 6 * * *"
+              and ENV.schedule_queue == "dvr")
+
+        reset(settings={"scheduled_sweep": False})
+        patch.install()
+        check("with the auto-run toggle off it removes the schedule instead",
+              ENV.schedule_calls == 0 and ENV.delete_calls == 1)
+
+        app_init.should_skip_initialization = lambda: True
+        reset()
+        patch.install()
+        check("every other worker leaves the schedule alone",
+              ENV.schedule_calls == 0 and ENV.delete_calls == 0)
+
+        def _boom():
+            raise RuntimeError("no app_initialization")
+        app_init.should_skip_initialization = _boom
+        reset()
+        ok = patch.install()
+        check("an unusable should_skip check fails safe (patch on, schedule untouched)",
+              ok and ENV.schedule_calls == 0 and ENV.delete_calls == 0)
+    finally:
+        app_init.should_skip_initialization = saved
+        patch.uninstall(remove_sched=False)
+
+
+def test_status_shows_the_id_mode():
+    print("test_status_shows_the_id_mode")
+    reset()
+    cfg = patch._load_config(force=True)
+    live = {"total": 0, "by_account": {}, "by_age": {}, "error": None}
+    msg = patch.build_status_message(cfg, {"series": {}}, live, 1, True,
+                                     id_mode="series")
+    check("status names the detected XC id mode", "xc_ids=series" in msg)
+    msg = patch.build_status_message(cfg, {"series": {}}, live, 1, True)
+    check("and says so when it is unknown", "xc_ids=?" in msg)
+
+
 def test_enqueue_failure_tolerated():
     print("test_enqueue_failure_tolerated")
     reset(delay_raises=True)
@@ -1557,6 +1819,14 @@ if __name__ == "__main__":
     test_auto_retry_chain_continues_then_stops()
     test_manifest_parity()
     test_enqueue_failure_tolerated()
+    test_series_id_mode_detection()
+    test_v033_series_id_is_the_series_pk()
+    test_v032_series_id_is_still_a_relation_pk()
+    test_stop_keeps_the_schedule_where_it_should()
+    test_plugin_stop_passes_the_reason()
+    test_preflight_fails_open_on_code_errors()
+    test_import_time_schedule_follows_should_skip()
+    test_status_shows_the_id_mode()
     try:
         os.remove(_scratch)
     except OSError:

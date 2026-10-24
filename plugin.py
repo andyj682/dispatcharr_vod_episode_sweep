@@ -56,7 +56,7 @@ class Plugin:
     # UI title only. README / repo / zip keep the fuller "Dispatcharr VOD
     # Episode Sweep" name; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Episode Sweep"
-    version = "1.1.0"
+    version = "1.1.1"
     description = (
         "Learns which VOD series a client syncs and once a day refreshes ALL of "
         "each watched show's provider/category relations so new episodes stop "
@@ -253,6 +253,7 @@ class Plugin:
                 "status": "ok",
                 "message": _patch.build_status_message(
                     cfg, wl, live, os.getpid(), _patch._ACTIVE,
+                    id_mode=_patch._xc_series_id_mode(),
                 ),
             }
 
@@ -297,6 +298,8 @@ class Plugin:
         return {"status": "error", "message": f"Unknown action: {action}"}
 
     def stop(self, context=None):
-        """Called by Dispatcharr on disable / delete / reload."""
-        _patch.uninstall()
+        """Called by Dispatcharr on disable / delete / reload (passed as
+        context["reason"]); whether the schedule row survives depends on it."""
+        reason = (context or {}).get("reason") if isinstance(context, dict) else None
+        _patch.stop_for_reason(reason)
         return {"status": "ok", "message": "VOD episode sweep reverted"}

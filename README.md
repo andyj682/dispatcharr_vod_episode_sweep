@@ -180,6 +180,15 @@ Dispatcharr, Celery, or DB required.
 5. **Retiring a client-side periodic refresh.** If your generator has its own
    periodic re-fetch, this supersedes it (the generator could only ever hit the
    top relation). Retire it *after* confirming this plugin works live.
+6. **Dispatcharr 0.33.0 changed what an XC `series_id` is** (it now names the
+   series itself rather than one provider's copy of it). From 1.1.1 the plugin
+   detects which release it is running on and handles both; **Show status**
+   reports it as `xc_ids=series` (0.33.0+) or `xc_ids=relation` (earlier).
+   Update the plugin to 1.1.1 **before** upgrading Dispatcharr to 0.33.0 —
+   1.1.0 on 0.33.0 silently watches the wrong series. If that already
+   happened, run **Clear watchlist** once on 1.1.1, then let your client do a
+   full resync so the list rebuilds. Your client may have its own steps for
+   this change, since any series ids it stored also change meaning.
 
 ## Storage
 

@@ -4,6 +4,43 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-10-24
+
+Required for Dispatcharr 0.33.0, and still works on earlier releases. Update
+the plugin **before** upgrading Dispatcharr.
+
+### Fixed
+
+- **Dispatcharr 0.33.0: the watchlist recorded the wrong series.** 0.33.0
+  changed the XC `series_id` from one provider's copy of a series (an
+  `M3USeriesRelation` id) to the series itself (a `Series` id). The two id
+  ranges overlap, so 1.1.0 did not fail. It quietly watched an unrelated series
+  for each one the client synced, and the real ones aged out after the 30-day
+  TTL. The plugin now detects the release and resolves the id the way that
+  release means it. There is deliberately no "try both" fallback, since an id
+  valid both ways would pick the wrong series. **Show status** reports the
+  detected mode as `xc_ids=series` or `xc_ids=relation`. If 1.1.0 already ran
+  on 0.33.0, run **Clear watchlist** once after updating, then have your client
+  do a full resync.
+- **The daily schedule could disappear after a plugin reload.** `stop()` used to
+  delete the beat schedule on every call, and the re-import recreates it in
+  only one web worker, so a reload handled elsewhere left no schedule until the
+  next restart. `stop()` now keeps the row on reload, and on disable when
+  Dispatcharr suspends and restores plugin schedules itself (0.33.0+). It still
+  removes it on delete, and on disable on earlier releases.
+- **The pre-flight provider check no longer fails closed on a code error.** A
+  `TypeError` or `AttributeError` from core's XC client means its API changed,
+  not that a provider is down. It used to skip every account, so sweeps and
+  retries dispatched nothing. It now skips the check instead, with one warning.
+
+### Tests
+
+- 166 → 213 checks. New: the 0.33.0 id meaning with deliberately overlapping
+  ids, per-release mode detection, stop-reason handling, code-error fail-open,
+  and the import-time schedule branch with `should_skip_initialization()`
+  returning False, which runs in production on 0.32.0+ and was never exercised
+  before. Each new guard was mutation-checked.
+
 ## [1.1.0] - 2026-10-05
 
 Adds a targeted retry, and stops the sweep hammering a provider whose API is
