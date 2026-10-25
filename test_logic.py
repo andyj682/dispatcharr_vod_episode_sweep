@@ -1250,7 +1250,7 @@ def test_run_record_formatting_stays_short():
     line = patch.format_run_record("last sweep", sweep)
     check("record renders on a single line", "\n" not in line)
     check("record stays well under a truncating UI box", len(line) < 200)
-    check("stale total labelled as pre-run", "stale before run 994" in line)
+    check("stale total labelled as pre-run", "stale before 994" in line)
     check("per-account split NOT repeated here (it is in the live audit, and "
           "repeating it grew these lines until the UI clipped them)",
           "Provider1 187" not in line and "Provider2 807" not in line)
@@ -1469,7 +1469,6 @@ def test_status_message_fits_the_ui_box():
     msg = patch.build_status_message(cfg, wl, live, 273, True, id_mode="relation")
     check("whole message fits the budget (len=%d)" % len(msg),
           len(msg) <= patch.STATUS_MAX_CHARS)
-    check("message was not clipped", not msg.endswith(" ..."))
     check("every account survives in the live breakdown",
           all(n in msg for n in names))
     check("live audit comes before the stored records",
@@ -1477,6 +1476,32 @@ def test_status_message_fits_the_ui_box():
     check("age buckets present", "age(cycles)" in msg)
     check("stored records do not repeat the per-account split",
           msg.count("Provider1 ") == 1)
+
+    # A realistic day must show IN FULL. Measured live: a ~435-character status
+    # was cut mid-line in the toast while ~420 showed whole, so the budget is
+    # set below that. Fixture = a real bad day (a whole provider down at sweep
+    # time, ~900 stale) on a 4-account setup, with 9-character account names, a
+    # 5-digit pid and every age bucket in use.
+    four = {"Provider%d" % i: 300 + i for i in range(1, 5)}
+    live4 = {"total": 1210, "by_account": four,
+             "by_age": {"never": 12, "1": 907, "2": 250, "3+": 41}, "error": None}
+    wl4 = {
+        "series": {str(i): 0 for i in range(1200)},
+        "last_sweep": dict(wl["last_sweep"], watched=1200, accounts=4,
+                           tasks=205, spread_seconds=4080, stale_total=1210),
+        "last_retry": dict(wl["last_retry"], retried_series=683, accounts=4,
+                           tasks=46, spread_seconds=900, stale_total=907,
+                           trigger="auto, 1 left"),
+    }
+    msg4 = patch.build_status_message(cfg, wl4, live4, 27300, True,
+                                      id_mode="relation")
+    check("a bad 4-account day fits without clipping (len=%d)" % len(msg4),
+          len(msg4) <= patch.STATUS_MAX_CHARS and not msg4.endswith(" ..."))
+    check("  ...including the last retry's stale count",
+          msg4.rstrip().endswith("stale before 907"))
+    check("budget stays under the measured toast limit",
+          patch.STATUS_MAX_CHARS <= 420)
+    check("no blank separator lines (they cost toast space)", "\n\n" not in msg4)
 
     # An overrun must announce itself rather than vanish mid-field.
     live["by_account"] = {("VeryLongProviderName%02d" % i): 999 for i in range(40)}

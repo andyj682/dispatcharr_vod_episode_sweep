@@ -32,6 +32,12 @@ the plugin **before** upgrading Dispatcharr.
   `TypeError` or `AttributeError` from core's XC client means its API changed,
   not that a provider is down. It used to skip every account, so sweeps and
   retries dispatched nothing. It now skips the check instead, with one warning.
+- **Show status was cut off at the end.** The result toast shows less than the
+  plugin assumed: ~420 characters fit and ~435 didn't. The message is now
+  shorter, with a terser settings line, no blank lines and no repeated
+  watched count. A typical day comes to ~340 characters and a bad day with 4
+  providers to ~400, under a cap of 400. The auto-retry trigger now reads
+  `auto, 1 left`.
 
 ### Tests
 

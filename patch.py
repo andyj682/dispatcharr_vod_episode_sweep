@@ -156,12 +156,14 @@ RETRY_SETTLE_SECONDS = 300
 # (likely a provider error last cycle). Sized just over the daily cadence.
 STALE_HOURS = 25
 
-# Hard ceiling for the status action's message. The UI's result box clips a
-# long message with no indication, and in practice it twice cut off the
-# per-account stale breakdown -- the one thing worth having during an
-# incident. Stay well inside it, and order the message so anything lost is
-# the least important part.
-STATUS_MAX_CHARS = 700
+# Hard ceiling for the status action's message. The result appears in a toast
+# notification that silently shows only so much: measured live, ~420
+# characters showed in full and ~435 were cut mid-line (nothing in Dispatcharr
+# shortens the text itself, so the limit is the toast's size, and blank lines
+# cost space too). An earlier 700 here was never measured and did not protect
+# anything. Stay inside it, and order the message so anything lost is the
+# least important part.
+STATUS_MAX_CHARS = 400
 
 # In-process: skip re-recording the same series to the DB more than once per
 # this window (bounds writes during a client's burst of get_series_info calls).
@@ -1146,15 +1148,15 @@ def format_run_record(label, rec) -> str:
     if not rec:
         return f"{label}: none yet"
     bits = [str(rec.get("at", "?"))[:16]]   # minutes are enough here
-    if rec.get("watched") is not None:
-        bits.append(f"{rec['watched']} watched")
+    # No "watched" count here: the header already shows it, and the space is
+    # needed (a sweep's count only differs from it by that day's TTL prune).
     if rec.get("retried_series") is not None:
         bits.append(f"{rec['retried_series']} retried")
     bits.append(f"{rec.get('accounts', 0)} acct")
     bits.append(f"{rec.get('tasks', 0)} tasks")
     bits.append(f"~{rec.get('spread_seconds', 0)}s")
     if rec.get("auto_retry_passes"):
-        bits.append(f"auto-retry armed x{rec['auto_retry_passes']}")
+        bits.append(f"retry x{rec['auto_retry_passes']}")
     if rec.get("trigger"):
         bits.append(str(rec["trigger"]))
     out = f"{label}: " + " | ".join(bits)
@@ -1162,7 +1164,7 @@ def format_run_record(label, rec) -> str:
         # Total only. The per-account split is in the live audit and in the
         # logs; repeating it here is what made these lines grow with the
         # number of accounts until the UI clipped them.
-        out += f" | stale before run {rec['stale_total']}"
+        out += f" | stale before {rec['stale_total']}"
     if rec.get("skipped"):
         out += f" | skipped: {rec['skipped']}"
     if rec.get("skipped_accounts"):
@@ -1193,14 +1195,17 @@ def build_status_message(cfg, watchlist, live, pid, active, id_mode=None) -> str
     age = live.get("by_age") or {}
     age_str = " ".join(f"{k}={age.get(k, 0)}" for k in ("never", "1", "2", "3+"))
 
+    # Settings echo, terse on purpose: it duplicates the settings page and is
+    # here only so a pasted status carries its own context. Defaults-shaped
+    # values stay quiet; the abnormal states are spelled out in capitals.
     head = (
-        f"active={active} pid={pid} xc_ids={id_mode or '?'} "
-        f"(one worker; see logs for all)\n"
-        f"sweep {cfg['sweep_hour']:02d}:00 auto={cfg['scheduled_sweep']} "
-        f"q={cfg['schedule_queue']} retry={retry} | "
-        f"batch={cfg['batch_size']} space={cfg['spacing_seconds']:.0f}s "
-        f"ttl={cfg['ttl_seconds'] / 86400.0:.0f}d | "
-        f"watched={len(watchlist.get('series', {}))}"
+        f"{'' if active else 'PATCH INACTIVE '}pid={pid} xc_ids={id_mode or '?'} "
+        f"watched={len(watchlist.get('series', {}))}\n"
+        f"sweep {cfg['sweep_hour']:02d}:00"
+        f"{'' if cfg['scheduled_sweep'] else ' AUTO-RUN OFF'} "
+        f"q={cfg['schedule_queue']} retry={retry} "
+        f"batch={cfg['batch_size']}/{cfg['spacing_seconds']:.0f}s "
+        f"ttl={cfg['ttl_seconds'] / 86400.0:.0f}d"
     )
 
     stale = f"STALE NOW {live.get('total', 0)}"
@@ -1210,7 +1215,7 @@ def build_status_message(cfg, watchlist, live, pid, active, id_mode=None) -> str
     if live.get("error"):
         stale += f"\naudit error: {live['error']}"
 
-    body = "\n\n".join([
+    body = "\n".join([
         head,
         stale,
         format_run_record("last sweep", watchlist.get("last_sweep")),
@@ -1391,7 +1396,7 @@ def run_retry(passes_left=1):
     except (TypeError, ValueError):
         passes_left = 0
 
-    summary = retry_stale_impl(trigger=f"auto ({passes_left} pass(es) left)")
+    summary = retry_stale_impl(trigger=f"auto, {passes_left} left")
 
     if summary.get("skipped") in ("plugin disabled", "watchlist empty"):
         return summary
