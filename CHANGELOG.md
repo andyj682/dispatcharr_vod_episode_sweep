@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.1] - 2026-10-24
+## [1.1.1] - 2026-10-27
 
 Required for Dispatcharr 0.33.0, and still works on earlier releases. Update
 the plugin **before** upgrading Dispatcharr.
@@ -41,11 +41,12 @@ the plugin **before** upgrading Dispatcharr.
 
 ### Tests
 
-- 166 → 213 checks. New: the 0.33.0 id meaning with deliberately overlapping
+- 166 → 216 checks. New: the 0.33.0 id meaning with deliberately overlapping
   ids, per-release mode detection, stop-reason handling, code-error fail-open,
-  and the import-time schedule branch with `should_skip_initialization()`
+  the import-time schedule branch with `should_skip_initialization()`
   returning False, which runs in production on 0.32.0+ and was never exercised
-  before. Each new guard was mutation-checked.
+  before, and a realistic bad day that must fit the toast unclipped. Each new
+  guard was mutation-checked.
 
 ## [1.1.0] - 2026-10-05
 
