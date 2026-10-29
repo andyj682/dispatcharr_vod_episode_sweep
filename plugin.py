@@ -97,21 +97,34 @@ class Plugin:
             "type": "boolean",
             "default": True,
             "help_text": (
-                "After each sweep, automatically re-refresh any relations still "
-                "flagged stale -- the same thing the 'Retry stale relations' "
-                "action does. Does nothing when nothing is stale."
+                "After each sweep, keep re-refreshing whatever is still "
+                "flagged stale until nothing is, then stop. A provider that "
+                "stays down (about 90 minutes) or makes no progress is given "
+                "up for the day, and the rest carry on. Does nothing on a "
+                "clean day."
             ),
         },
         {
-            "id": "retry_passes",
-            "label": "Retry passes",
+            "id": "retry_max_passes",
+            "label": "Max retry passes per day",
             "type": "number",
-            "default": 2,
+            "default": 12,
             "help_text": (
-                "How many automatic retry passes to make after a sweep. Each "
-                "pass only touches what is still stale, so passes get rapidly "
-                "cheaper; the chain stops early once nothing is stale. 0 turns "
-                "auto-retry off. Default 2."
+                "Upper limit on automatic retry passes per day (0-24). The "
+                "chain normally stops well before this, as soon as nothing "
+                "is stale. 0 turns auto-retry off. Default 12."
+            ),
+        },
+        {
+            "id": "retry_quiet_window",
+            "label": "Quiet window for retries (optional)",
+            "type": "string",
+            "default": "",
+            "help_text": (
+                "Optional time range, like 09:55-10:15, when automatic "
+                "retries make no provider calls: a pass due inside it waits "
+                "until it ends. Use it to keep retries out of your client's "
+                "library sync. Empty = none."
             ),
         },
         {
@@ -386,7 +399,10 @@ class Plugin:
             # relations that are actually stale.
             try:
                 summary = _patch.retry_stale_impl()
-                return {"status": "ok", "message": f"Retry ran: {summary}"}
+                # The compact record line, not the raw dict: the dict carries
+                # per-account-id maps for the chain and overran the toast.
+                return {"status": "ok",
+                        "message": _patch.format_run_record("Retry ran", summary)}
             except Exception as exc:
                 logger.exception("[VOD-SWEEP] retry_stale failed")
                 return {"status": "error", "message": f"Retry failed: {exc}"}

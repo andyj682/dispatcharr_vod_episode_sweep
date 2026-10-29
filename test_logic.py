@@ -1358,107 +1358,417 @@ def test_auto_retry_config():
     reset()
     cfg = patch._load_config(force=True)
     check("auto-retry defaults on", cfg["auto_retry"] is True)
-    check("default passes is 2", cfg["retry_passes"] == 2)
+    check("default pass cap is 12", cfg["retry_passes"] == 12)
+    check("no quiet window by default",
+          cfg["quiet_window"] is None and cfg["quiet_window_text"] == "")
 
-    reset(settings={"retry_passes": 999})
-    check("passes clamped to the hard ceiling",
+    # 1.1.x's fixed count, saved as 2 on most installs, must not cap the
+    # until-done chain at two passes.
+    reset(settings={"retry_passes": 2})
+    check("the old retry_passes setting is ignored",
+          patch._load_config(force=True)["retry_passes"] == 12)
+
+    reset(settings={"retry_max_passes": 999})
+    check("cap clamped to the hard ceiling",
           patch._load_config(force=True)["retry_passes"] == patch.MAX_RETRY_PASSES)
 
-    reset(settings={"retry_passes": -3})
-    check("negative passes clamp to 0",
+    reset(settings={"retry_max_passes": -3})
+    check("negative cap clamps to 0",
           patch._load_config(force=True)["retry_passes"] == 0)
 
     reset(settings={"auto_retry": False})
     check("auto-retry can be turned off",
           patch._load_config(force=True)["auto_retry"] is False)
 
+    reset(settings={"retry_quiet_window": "09:55-10:15"})
+    cfg = patch._load_config(force=True)
+    check("quiet window parsed", cfg["quiet_window"] == (595, 615))
 
-def test_sweep_arms_the_retry_chain():
-    print("test_sweep_arms_the_retry_chain")
-    reset(settings={"retry_passes": 3})
+    reset(settings={"retry_quiet_window": "nine to ten"})
+    cfg = patch._load_config(force=True)
+    check("a malformed window means no window (never blocks retries)",
+          cfg["quiet_window"] is None)
+    check("...but the text is kept so status can flag it",
+          cfg["quiet_window_text"] == "nine to ten")
+
+
+def test_quiet_window_math():
+    print("test_quiet_window_math")
+    from datetime import datetime
+    pw = patch.parse_quiet_window
+    check("HH:MM-HH:MM parses", pw("09:55-10:15") == (595, 615))
+    check("spaces and one-digit hours accepted", pw(" 9:55 - 10:15 ") == (595, 615))
+    check("wrapping window parses", pw("23:30-00:30") == (1410, 30))
+    check("empty is no window", pw("") is None and pw(None) is None)
+    check("out-of-range hour rejected", pw("24:00-01:00") is None)
+    check("out-of-range minute rejected", pw("09:60-10:00") is None)
+    check("equal ends are no window", pw("10:00-10:00") is None)
+
+    w = (595, 615)
+    at = lambda h, m, s=0: datetime(2026, 10, 29, h, m, s)
+    check("before the window: no wait", patch.quiet_wait_seconds(w, at(9, 54, 59)) == 0)
+    check("at the start: wait the whole window",
+          patch.quiet_wait_seconds(w, at(9, 55)) == 20 * 60)
+    check("inside: wait until the end",
+          patch.quiet_wait_seconds(w, at(10, 5)) == 10 * 60)
+    check("the end itself is outside", patch.quiet_wait_seconds(w, at(10, 15)) == 0)
+    check("no window: never waits", patch.quiet_wait_seconds(None, at(10, 0)) == 0)
+
+    wrap = (1410, 30)
+    check("wrap, before midnight: wait to 00:30",
+          patch.quiet_wait_seconds(wrap, at(23, 45)) == 45 * 60)
+    check("wrap, after midnight: wait to 00:30",
+          patch.quiet_wait_seconds(wrap, at(0, 10)) == 20 * 60)
+    check("wrap, midday: no wait", patch.quiet_wait_seconds(wrap, at(12, 0)) == 0)
+
+    # The delay is checked where the pass would LAND, not where it is queued.
+    check("a pass landing inside the window is pushed to its end",
+          patch.quiet_adjusted_delay(w, at(9, 50), 600) == 25 * 60)
+    check("a pass landing after the window is untouched",
+          patch.quiet_adjusted_delay(w, at(9, 50), 1800) == 1800)
+    check("no window: delay untouched",
+          patch.quiet_adjusted_delay(None, at(9, 50), 600) == 600)
+
+
+def test_chain_progress_give_up():
+    """Logins work but every episode lookup fails (2026-10-27): the pre-flight
+    can't see it, so the chain must notice that nothing it sends clears."""
+    print("test_chain_progress_give_up")
+    c = patch.new_chain(1.0)
+    c["sent"] = {"7": 10, "9": 10}
+    c, exclude, held, newly = patch.chain_assess(c, {"7": 10, "9": 4}, 100.0)
+    check("one low pass is only a strike", newly == [] and "7" not in exclude)
+    check("low pass counted", c["low"].get("7") == 1)
+    check("good progress keeps no count", "9" not in c["low"])
+
+    c["sent"] = {"7": 10, "9": 4}
+    c, exclude, held, newly = patch.chain_assess(c, {"7": 10, "9": 2}, 200.0)
+    check("two low passes in a row: given up", newly == ["7"])
+    check("reason recorded", c["gave_up"]["7"] == "no progress")
+    check("given-up account excluded", "7" in exclude and "9" not in exclude)
+
+    c2 = patch.new_chain(1.0)
+    c2["sent"] = {"7": 10}
+    c2, _, _, _ = patch.chain_assess(c2, {"7": 10}, 100.0)
+    c2["sent"] = {"7": 10}
+    c2, _, _, newly = patch.chain_assess(c2, {"7": 5}, 200.0)
+    check("progress resets the count", newly == [] and "7" not in c2["low"])
+
+    # 50%-flaky provider: halves each pass, never given up.
+    c3, left = patch.new_chain(1.0), 185
+    gave = []
+    for i in range(8):
+        c3["sent"] = {"7": left}
+        left = left // 2
+        c3, _, _, newly = patch.chain_assess(c3, {"7": left}, float(i))
+        gave += newly
+    check("a provider clearing half per pass is never given up", gave == [])
+
+    c4 = patch.new_chain(1.0)
+    c4["sent"] = {"7": 3}
+    c4, _, _, _ = patch.chain_assess(c4, {"7": 9}, 1.0)
+    check("more stale than sent can't read as negative progress",
+          c4["low"].get("7") == 1)
+
+
+def test_chain_unreachable_backoff():
+    print("test_chain_unreachable_backoff")
+    B = patch.UNREACHABLE_BACKOFF_SECONDS
+    c, newly = patch.chain_record(patch.new_chain(1.0), {"7": 5}, ["9"],
+                                  {"7": "Provider7", "9": "Provider9"}, 1000.0)
+    check("first strike, nobody given up", newly == [] and c["strikes"]["9"] == 1)
+    check("retried after the base backoff", c["next_try"]["9"] == 1000.0 + B)
+    check("what went out is remembered for scoring", c["sent"] == {"7": 5})
+    check("names kept for status", c["names"]["9"] == "Provider9")
+
+    _, exclude, held, _ = patch.chain_assess(c, {"7": 2, "9": 8}, 1000.0 + 60)
+    check("held while backing off", held == ["9"] and "9" in exclude)
+    _, exclude, held, _ = patch.chain_assess(c, {"7": 2, "9": 8}, 1000.0 + B + 1)
+    check("tried again once the backoff is over", held == [] and "9" not in exclude)
+
+    c, newly = patch.chain_record(c, {}, ["9"], {}, 5000.0)
+    check("second strike doubles the backoff", c["next_try"]["9"] == 5000.0 + 2 * B)
+    c, newly = patch.chain_record(c, {}, ["9"], {}, 9000.0)
+    check("third strike: given up", newly == ["9"] and c["gave_up"]["9"] == "unreachable")
+    check("given up: no more retry time", "9" not in c["next_try"])
+
+    c, _ = patch.chain_record(patch.new_chain(1.0), {}, ["9"], {}, 1.0)
+    c, _ = patch.chain_record(c, {"9": 4}, [], {}, 2.0)
+    check("reaching it again clears the strikes",
+          "9" not in c["strikes"] and "9" not in c["next_try"])
+
+
+def test_chain_next_decisions():
+    print("test_chain_next_decisions")
+    S = patch.RETRY_SETTLE_SECONDS
+    c = patch.new_chain(1.0)
+    check("nothing stale ends the chain",
+          patch.chain_next(c, {}, 0, 1, 12, 0.0) == (None, "nothing stale"))
+    c["gave_up"] = {"9": "unreachable"}
+    check("only given-up accounts left ends it",
+          patch.chain_next(c, {"9": 40}, 0, 1, 12, 0.0) == (None, "gave up on the rest"))
+    c["sent"] = {"7": 3}
+    check("cap reached ends it",
+          patch.chain_next(c, {"7": 3}, 60, 12, 12, 0.0) == (None, "pass cap reached"))
+    check("work went out: wait its spread plus the settle margin",
+          patch.chain_next(c, {"7": 3}, 60, 1, 12, 0.0) == (60 + S, "retrying"))
+    c["sent"] = {}
+    c["next_try"] = {"8": 4000.0}
+    delay, why = patch.chain_next(c, {"8": 5}, 0, 2, 12, 1000.0)
+    check("nothing went out: sleep until the first backoff ends",
+          delay == 3000 and why == "waiting on unreachable")
+    delay, _ = patch.chain_next(c, {"8": 5}, 0, 2, 12, 3990.0)
+    check("...but never sooner than the settle margin", delay == S)
+
+
+def _retry_tasks():
+    return [t for t in ENV.plugin_tasks if t["name"] == patch.RETRY_TASK_PATH]
+
+
+def _swept(settings=None, **kw):
+    reset(settings=settings or {}, **kw)
     seed_relations()
     patch._observe(11)
     patch._observe(21)
     summary = patch.run_sweep_impl()
+    return summary
 
-    chain = [t for t in ENV.plugin_tasks if t["name"] == patch.RETRY_TASK_PATH]
+
+def test_sweep_arms_the_retry_chain():
+    print("test_sweep_arms_the_retry_chain")
+    summary = _swept({"retry_max_passes": 3})
+    chain = _retry_tasks()
     check("sweep armed exactly one retry pass", len(chain) == 1)
-    check("chain carries the configured pass count", chain[0]["args"] == [3])
+    check("first pass is pass 1 of THIS sweep's chain",
+          chain[0]["args"] == [1, summary["at_epoch"]])
     check("chain routed to the plugin-capable queue (NOT the prefork default)",
           chain[0]["queue"] == "dvr")
     check("chain waits out the sweep's own spread plus a settle margin",
           chain[0]["countdown"] == summary["spread_seconds"] + patch.RETRY_SETTLE_SECONDS)
-    check("sweep records that a retry was armed",
-          summary["auto_retry_passes"] == 3)
+    check("sweep records the pass cap it armed", summary["auto_retry_passes"] == 3)
+    stored = patch.get_watchlist(force=True)["chain"]
+    check("chain state stored with the sweep", stored["sweep_at"] == summary["at_epoch"])
+    check("the sweep's dispatch is the chain's first observation",
+          stored["sent"] == {"7": 2, "9": 1})
 
 
 def test_sweep_does_not_arm_when_disabled():
     print("test_sweep_does_not_arm_when_disabled")
-    reset(settings={"auto_retry": False})
-    seed_relations()
-    patch._observe(11)
-    summary = patch.run_sweep_impl()
-    check("no chain armed when auto-retry is off",
-          [t for t in ENV.plugin_tasks if t["name"] == patch.RETRY_TASK_PATH] == [])
+    summary = _swept({"auto_retry": False})
+    check("no chain armed when auto-retry is off", _retry_tasks() == [])
     check("summary reports none armed", summary["auto_retry_passes"] == 0)
+    check("no chain state stored", patch.get_watchlist(force=True)["chain"] is None)
 
-    reset(settings={"retry_passes": 0})
-    seed_relations()
-    patch._observe(11)
-    patch.run_sweep_impl()
-    check("passes=0 also means no chain",
-          [t for t in ENV.plugin_tasks if t["name"] == patch.RETRY_TASK_PATH] == [])
+    _swept({"retry_max_passes": 0})
+    check("cap 0 also means no chain", _retry_tasks() == [])
+
+
+def test_sweep_unreachable_is_first_strike():
+    print("test_sweep_unreachable_is_first_strike")
+    ENV_fail = {"http://p9.example": True}
+    _swept(auth_fail=ENV_fail)
+    stored = patch.get_watchlist(force=True)["chain"]
+    check("unreachable at the sweep counts as strike 1",
+          stored["strikes"] == {"9": 1} and "9" in stored["next_try"])
+    check("only the reachable account's dispatch is scored", stored["sent"] == {"7": 2})
+
+
+STALE7 = [{"m3u_account_id": 7, "m3u_account__name": "Provider7",
+           "series_id": 100, "last_episode_refresh": None}]
+
+
+def _run_pass(args, rows):
+    ENV.plugin_tasks.clear()
+    saved = _stub_stale(rows)
+    try:
+        return patch.run_retry(*args)
+    finally:
+        patch._stale_rows = saved
 
 
 def test_auto_retry_chain_continues_then_stops():
     print("test_auto_retry_chain_continues_then_stops")
-    reset()
-    seed_relations()
-    patch._observe(11)
-    rows = [{"m3u_account_id": 7, "m3u_account__name": "Provider1",
-             "series_id": 100, "last_episode_refresh": None}]
-    saved = _stub_stale(rows)
-    try:
-        summary = patch.run_retry(3)   # stale remains -> should chain
-    finally:
-        patch._stale_rows = saved
-    chain = [t for t in ENV.plugin_tasks if t["name"] == patch.RETRY_TASK_PATH]
-    check("still-stale pass schedules the next one", len(chain) == 1)
-    check("pass count decrements", chain[0]["args"] == [2])
+    _swept()
+    args = _retry_tasks()[0]["args"]
+    summary = _run_pass(args, STALE7)
+    nxt = _retry_tasks()
+    check("still-stale pass schedules the next one", len(nxt) == 1)
+    check("next pass is pass 2 of the same chain", nxt[0]["args"] == [2, args[1]])
     # The countdown is load-bearing: audit too early and the next pass re-tries
-    # work still in flight, burning the whole chain for nothing.
+    # work still in flight, burning the chain for nothing.
     check("next pass waits out this pass's spread plus the settle margin",
-          chain[0]["countdown"]
-          == summary["spread_seconds"] + patch.RETRY_SETTLE_SECONDS)
-    check("chain countdown is never zero",
-          chain[0]["countdown"] >= patch.RETRY_SETTLE_SECONDS)
-    check("chain stays on the plugin-capable queue", chain[0]["queue"] == "dvr")
-    check("trigger records that this was automatic",
-          "auto" in (summary.get("trigger") or ""))
+          nxt[0]["countdown"] == summary["spread_seconds"] + patch.RETRY_SETTLE_SECONDS)
+    check("chain stays on the plugin-capable queue", nxt[0]["queue"] == "dvr")
+    check("trigger shows pass and cap", summary.get("trigger") == "auto 1/12")
+    wl = patch.get_watchlist(force=True)
+    check("pass recorded on the chain", wl["chain"]["pass"] == 1)
+    check("retry record carries the next pass time", bool(wl["last_retry"].get("next")))
 
-    # Nothing stale -> chain must END, not burn the remaining passes.
-    reset()
-    seed_relations()
-    patch._observe(11)
-    saved = _stub_stale([])
+    # Nothing stale -> chain ENDS, not burns the remaining passes.
+    summary = _run_pass(nxt[0]["args"], [])
+    check("a clean pass ends the chain", _retry_tasks() == [])
+    wl = patch.get_watchlist(force=True)
+    check("chain marked done", wl["chain"]["done"] == "nothing stale")
+    check("retry record says done", wl["last_retry"].get("done") is True
+          and not wl["last_retry"].get("next"))
+
+
+def test_chain_respects_the_pass_cap():
+    print("test_chain_respects_the_pass_cap")
+    _swept({"retry_max_passes": 2})
+    args = _retry_tasks()[0]["args"]
+    _run_pass(args, STALE7)
+    nxt = _retry_tasks()
+    check("pass 1 of 2 chains on", len(nxt) == 1)
+    _run_pass(nxt[0]["args"], STALE7)
+    check("pass 2 of 2 does not", _retry_tasks() == [])
+    check("chain marked capped",
+          patch.get_watchlist(force=True)["chain"]["done"] == "pass cap reached")
+
+
+def test_chain_superseded_and_duplicates():
+    print("test_chain_superseded_and_duplicates")
+    _swept()
+    old = _retry_tasks()[0]["args"]
+    CLOCK.advance(3600)
+    patch.run_sweep_impl()            # e.g. "Run sweep now": a new chain
+    before = len(ENV.enqueued)
+    summary = _run_pass(old, STALE7)
+    check("a pass from the replaced chain stops",
+          summary["skipped"] == "superseded" and _retry_tasks() == [])
+    check("...and dispatches nothing", len(ENV.enqueued) == before)
+
+    _swept()
+    args = _retry_tasks()[0]["args"]
+    before = len(ENV.enqueued)
+    _run_pass(args, STALE7)
+    mid = len(ENV.enqueued)
+    summary = _run_pass(args, STALE7)
+    check("a duplicate delivery of the same pass is ignored",
+          summary["skipped"] == "already run" and len(ENV.enqueued) == mid > before)
+
+    summary = _run_pass([3], STALE7)
+    check("a pass queued by an older version is ignored",
+          summary["skipped"] == "superseded")
+
+    _swept()
+    args = _retry_tasks()[0]["args"]
+    patch.clear_watchlist()
+    summary = _run_pass(args, STALE7)
+    check("Clear watchlist stops a running chain", summary["skipped"] == "superseded")
+
+
+def test_chain_stops_when_old_or_turned_off():
+    print("test_chain_stops_when_old_or_turned_off")
+    _swept()
+    args = _retry_tasks()[0]["args"]
+    CLOCK.advance(patch.CHAIN_MAX_AGE_SECONDS + 1)
+    summary = _run_pass(args, STALE7)
+    check("a chain never runs into the next day",
+          summary["skipped"] == "chain too old" and _retry_tasks() == [])
+
+    _swept()
+    args = _retry_tasks()[0]["args"]
+    ENV.settings = {"auto_retry": False}
+    patch.invalidate_config_cache()
+    summary = _run_pass(args, STALE7)
+    check("turning auto-retry off stops a running chain",
+          summary["skipped"] == "auto-retry turned off" and _retry_tasks() == [])
+
+
+def test_chain_gives_up_on_a_dead_provider():
+    """End to end: account 9 is down all day, account 7 is flaky. The chain
+    keeps working 7, backs off from 9, gives 9 up, and ends."""
+    print("test_chain_gives_up_on_a_dead_provider")
+    _swept(auth_fail={"http://p9.example": True})        # strike 1 at the sweep
+    rows9 = [{"m3u_account_id": 9, "m3u_account__name": "Provider9",
+              "series_id": 100, "last_episode_refresh": None}]
+    args = _retry_tasks()[0]["args"]
+
+    n0, probes = len(ENV.enqueued), len(ENV.auth_calls)
+    summary = _run_pass(args, STALE7 + rows9)
+    check("pass 1 retries the flaky account",
+          sorted({a for a, _ in ENV.enqueued[n0:]}) == [7])
+    check("...without probing the held one",
+          not any("p9." in u for u in ENV.auth_calls[probes:]))
+    check("pass 1 holds the dead one (backing off), no probe spent",
+          summary.get("held_names") == ["Provider9"])
+    rec = patch.format_run_record("last retry", patch.get_watchlist(force=True)["last_retry"])
+    check("status shows it waiting", "WAITING Provider9" in rec)
+
+    # 7 clears; only 9 is left, still backing off -> sleep until it is due.
+    nxt = _retry_tasks()[0]
+    summary = _run_pass(nxt["args"], rows9)
+    nxt = _retry_tasks()[0]
+    check("with only a held account left, sleep until its backoff ends",
+          nxt["countdown"] >= patch.UNREACHABLE_BACKOFF_SECONDS - 600)
+
+    CLOCK.advance(nxt["countdown"])
+    summary = _run_pass(nxt["args"], rows9)              # strike 2
+    nxt = _retry_tasks()[0]
+    check("strike 2: backoff doubles",
+          nxt["countdown"] >= 2 * patch.UNREACHABLE_BACKOFF_SECONDS - 600)
+
+    CLOCK.advance(nxt["countdown"])
+    summary = _run_pass(nxt["args"], rows9)              # strike 3
+    check("strike 3: given up, chain ends", _retry_tasks() == [])
+    wl = patch.get_watchlist(force=True)
+    check("chain done for the right reason", wl["chain"]["done"] == "gave up on the rest")
+    rec = patch.format_run_record("last retry", wl["last_retry"])
+    check("status names the provider given up", "GAVE UP Provider9" in rec)
+    check("status says done", rec.endswith("| done"))
+
+
+def test_chain_waits_out_the_quiet_window():
+    print("test_chain_waits_out_the_quiet_window")
+    from datetime import datetime
+    _swept({"retry_quiet_window": "09:55-10:15"})
+    args = _retry_tasks()[0]["args"]
+    saved = patch._now_local
+    patch._now_local = lambda: datetime(2026, 10, 29, 10, 0, 0)
     try:
-        patch.run_retry(3)
+        before = len(ENV.enqueued)
+        summary = _run_pass(args, STALE7)
+        t = _retry_tasks()
+        check("no provider traffic inside the window", len(ENV.enqueued) == before)
+        check("the SAME pass is re-queued for the window's end",
+              len(t) == 1 and t[0]["args"] == args and t[0]["countdown"] == 15 * 60)
+        check("not counted as a pass",
+              patch.get_watchlist(force=True)["chain"]["pass"] == 0
+              and summary["skipped"] == "quiet window")
+
+        patch._now_local = lambda: datetime(2026, 10, 29, 9, 50, 0)
+        _run_pass(args, STALE7)
+        t = _retry_tasks()
+        check("a next pass that would land inside the window waits for its end",
+              len(t) == 1 and t[0]["countdown"] >= 25 * 60)
+    finally:
+        patch._now_local = saved
+
+    cfg = patch._load_config(force=True)
+    wl = patch.get_watchlist(force=True)
+    msg = patch.build_status_message(cfg, wl, {"total": 0}, 1, True)
+    check("status shows the window", "quiet 09:55-10:15" in msg)
+    reset(settings={"retry_quiet_window": "10-11"})
+    msg = patch.build_status_message(patch._load_config(force=True), wl, {"total": 0}, 1, True)
+    check("status flags a window it could not read", "quiet BAD" in msg)
+
+
+def test_manual_retry_ignores_the_chain():
+    print("test_manual_retry_ignores_the_chain")
+    _swept(auth_fail={"http://p9.example": True})
+    ENV.auth_fail = {}
+    rows9 = [{"m3u_account_id": 9, "m3u_account__name": "Provider9",
+              "series_id": 100, "last_episode_refresh": None}]
+    saved = _stub_stale(rows9)
+    try:
+        patch.retry_stale_impl()
     finally:
         patch._stale_rows = saved
-    check("a clean pass ends the chain",
-          [t for t in ENV.plugin_tasks if t["name"] == patch.RETRY_TASK_PATH] == [])
-
-    # Last pass -> no further scheduling even with work outstanding.
-    reset()
-    seed_relations()
-    patch._observe(11)
-    saved = _stub_stale(rows)
-    try:
-        patch.run_retry(1)
-    finally:
-        patch._stale_rows = saved
-    check("final pass does not chain",
-          [t for t in ENV.plugin_tasks if t["name"] == patch.RETRY_TASK_PATH] == [])
+    check("a manual retry tries an account the chain is holding",
+          ENV.enqueued[-1][0] == 9)
+    check("...and records its own result",
+          patch.get_watchlist(force=True)["last_retry"]["trigger"] == "manual")
 
 
 def test_status_message_fits_the_ui_box():
@@ -1508,7 +1818,9 @@ def test_status_message_fits_the_ui_box():
     # was cut mid-line in the toast while ~420 showed whole, so the budget is
     # set below that. Fixture = a real bad day (a whole provider down at sweep
     # time, ~900 stale) on a 4-account setup, with 9-character account names, a
-    # 5-digit pid and every age bucket in use.
+    # 5-digit pid and every age bucket in use. Since 1.2.0 the retry line also
+    # carries the chain's state (one provider backing off, the next pass time)
+    # and the header a quiet window.
     four = {"Provider%d" % i: 300 + i for i in range(1, 5)}
     live4 = {"total": 1210, "by_account": four,
              "by_age": {"never": 12, "1": 907, "2": 250, "3+": 41}, "error": None}
@@ -1518,14 +1830,16 @@ def test_status_message_fits_the_ui_box():
                            tasks=205, spread_seconds=4080, stale_total=1210),
         "last_retry": dict(wl["last_retry"], retried_series=683, accounts=4,
                            tasks=46, spread_seconds=900, stale_total=907,
-                           trigger="auto, 1 left"),
+                           trigger="auto 4/12", held_names=["Provider4"],
+                           next="10:42"),
     }
-    msg4 = patch.build_status_message(cfg, wl4, live4, 27300, True,
+    cfg4 = dict(cfg, quiet_window=(595, 615), quiet_window_text="09:55-10:15")
+    msg4 = patch.build_status_message(cfg4, wl4, live4, 27300, True,
                                       id_mode="relation", tmdb="1188/1196")
     check("a bad 4-account day fits without clipping (len=%d)" % len(msg4),
           len(msg4) <= patch.STATUS_MAX_CHARS and not msg4.endswith(" ..."))
-    check("  ...including the last retry's stale count",
-          msg4.rstrip().endswith("stale before 907"))
+    check("  ...including the chain's next pass time",
+          msg4.rstrip().endswith("| next 10:42"))
     check("budget stays under the measured toast limit",
           patch.STATUS_MAX_CHARS <= 420)
     check("no blank separator lines (they cost toast space)", "\n\n" not in msg4)
@@ -2457,6 +2771,17 @@ if __name__ == "__main__":
     test_sweep_arms_the_retry_chain()
     test_sweep_does_not_arm_when_disabled()
     test_auto_retry_chain_continues_then_stops()
+    test_quiet_window_math()
+    test_chain_progress_give_up()
+    test_chain_unreachable_backoff()
+    test_chain_next_decisions()
+    test_sweep_unreachable_is_first_strike()
+    test_chain_respects_the_pass_cap()
+    test_chain_superseded_and_duplicates()
+    test_chain_stops_when_old_or_turned_off()
+    test_chain_gives_up_on_a_dead_provider()
+    test_chain_waits_out_the_quiet_window()
+    test_manual_retry_ignores_the_chain()
     test_manifest_parity()
     test_enqueue_failure_tolerated()
     test_series_id_mode_detection()

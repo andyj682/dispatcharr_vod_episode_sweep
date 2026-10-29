@@ -258,6 +258,41 @@ where waiting and trying again is the right move. Passes are hard-capped
 independently of the setting so a misconfiguration cannot produce an unbounded
 chain.
 
+## Retry until done (v1.2.0)
+
+1.1.x made a fixed two passes. On a bad provider day that left a tail for the
+operator to clear by hand: five manual retries once, for a panel failing about
+half its calls at random. Tiering made each day's work small enough to keep
+going instead, so the chain now runs until nothing is stale, with three things
+to stop it wasting calls:
+
+- **Per-account give-up for the day.** An account unreachable at pre-flight
+  three passes in a row is given up. Its retries are spaced by a growing
+  backoff (30, then 60 minutes), so that takes about 90 minutes of real outage,
+  not three quick passes; in between the chain doesn't probe it, and sleeps
+  until it is due if nothing else is left. An account is also given up when
+  two passes in a row clear under 10% of what was sent to it: logins working
+  while every episode lookup fails, which the pre-flight can't see (2026-10-27,
+  every `get_series_info` a 502). Two, because one pass can read low just by
+  auditing before its tasks ran. A provider clearing half per pass never comes
+  close. The other accounts carry on.
+- **A daily cap** (default 12, at most 24) and a 20-hour age limit, so a chain
+  never runs into the next day's.
+- **An optional quiet window.** No pass starts inside it; one due inside it
+  waits for its end without counting as a pass. Off by default, since not
+  every setup has a client sync to protect.
+
+The chain's state (passes run, what each pass sent per account, strikes,
+backoffs, give-ups) is stored in the watchlist row and keyed to the sweep that
+started it. Each queued pass carries that key, so a pass from a chain replaced
+by a newer sweep (or by Clear watchlist) recognizes itself and stops rather
+than running beside the new one, and a duplicate delivery is ignored.
+
+The sweep's own dispatch is the chain's first observation: an account
+unreachable at the sweep is already on its first strike, and what the sweep
+sent is what the first pass scores. A **manual** retry ignores all of it and
+tries every account, because the operator asked.
+
 **Staleness age separates two different problems.** Stale relations are not all
 alike, and the distinction is quantitative rather than a matter of taste. If a
 provider fails a proportion `p` of requests independently, the chance of one

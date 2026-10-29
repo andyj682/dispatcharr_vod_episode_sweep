@@ -93,8 +93,9 @@ refresh task — so there's no separate Celery/beat setup to worry about.)
 | **Earliest sweep hour (0-23)** | 3 | Hour the daily sweep runs, in **Dispatcharr's configured system timezone** (not the container's UTC clock). With Auto-run daily sweep on, a beat timer fires it at this hour; otherwise it fires on the first client series request at/after it. Set it a bit *before* your client's daily sync. |
 | **Watchlist TTL (days)** | 30 | A series leaves the watchlist only after this long unseen **and** after your client has ignored 3 refreshes of it — or after 120 days unseen regardless. See note 7. |
 | **Auto-run daily sweep** | on | Run the sweep on a fixed daily timer (Celery beat) rather than waiting for client traffic — so it runs *before* your sync and new episodes appear in **one** sync instead of two. Off = opportunistic (traffic-triggered) only. |
-| **Auto-retry stale relations** | on | After each sweep, automatically re-refresh anything still flagged stale — the same work the Retry action does. Useful when a provider intermittently fails requests, since a later pass may succeed where the first didn't. Costs nothing on a clean day: the chain stops as soon as nothing is stale. |
-| **Retry passes** | 2 | How many automatic passes to make. Each one only touches what is still stale, so passes get rapidly cheaper. 0 turns auto-retry off. |
+| **Auto-retry stale relations** | on | After each sweep, keep re-refreshing whatever is still flagged stale until nothing is, then stop — the same work the Retry action does. Useful when a provider intermittently fails requests, since a later pass may succeed where the first didn't. A provider that stays unreachable (about 90 minutes, retried with a growing backoff) or makes no progress for two passes is given up for the day; the others carry on. Costs nothing on a clean day: one audit, no provider calls. |
+| **Max retry passes per day** | 12 | Upper limit on automatic passes (0–24). The chain normally stops well before it. 0 turns auto-retry off. (Replaces 1.1.x's *Retry passes*, a fixed count; the old setting is ignored.) |
+| **Quiet window for retries (optional)** | — | A time range like `09:55-10:15` when automatic retries make no provider calls; a pass due inside it waits until it ends. Use it to keep retries out of your client's library sync, starting it a few minutes early. May cross midnight. |
 | **Refresh by airing status** | on | Refresh airing shows daily and everything else on a rotation (plus anything new, carried over, or reported changed by its provider). Off = every watched show every day, as before 1.2.0. |
 | **TMDB API key (optional)** | — | A free TMDB key (v3 API key or v4 read access token). Lets the plugin follow each show's airing schedule, including pre-warming a show a few days before a new season. Only TMDB ids are sent. Falls back to Dispatcharr's `TMDB_API_KEY` environment variable; without either, stored episode air dates are used. |
 | **Airing window (days)** | 10 | How long after an episode airs (per TMDB) a show stays on the daily refresh — covers providers posting late. |
@@ -120,7 +121,11 @@ list. Only Xtream-Codes VOD series are affected.
   missed — alongside the stored `last_sweep` / `last_retry` records. The stored
   ones are snapshots taken *before* their run fanned out; the live figure is
   what reflects now. Relations missed on 3+ runs are unlikely to be bad luck —
-  those are the dead-content candidates. Unreachable providers are named.
+  those are the dead-content candidates. Unreachable providers are named. The
+  retry line shows the automatic chain's progress: `auto 4/12` (pass and cap),
+  `next 10:42` while it is still going or `done` once it has stopped, and any
+  provider it is `WAITING` on (backing off after a failed check) or has
+  `GAVE UP` on for the day.
 - **List watched series** — the current watchlist + the path to the debug file.
 - **Run sweep now** — run the sweep inline immediately, ignoring the daily timer.
 - **Retry stale relations** — re-refresh *only* the relations still flagged

@@ -147,12 +147,31 @@ DEFAULT_SPACING_SECONDS = 15.0  # delay added between successive chunk tasks (0 
 # each pass clears most of what the last one missed; a pass with nothing stale
 # does nothing and ends the chain.
 DEFAULT_AUTO_RETRY = True
-DEFAULT_RETRY_PASSES = 2
-MAX_RETRY_PASSES = 10           # hard ceiling, whatever the setting says
+# 1.2.0: the chain retries until nothing is stale or it gives up on what is
+# left, so this is a daily CAP, not a fixed count. Tiering made each day's
+# work small enough that a provider failing half its calls at random still
+# clears in ~8 cheap passes.
+DEFAULT_RETRY_PASSES = 12
+MAX_RETRY_PASSES = 24           # hard ceiling, whatever the setting says
 # A pass must not audit staleness until the previous pass's tasks have actually
 # RUN, not merely been dispatched -- they carry countdowns up to spread_seconds.
 # This is the margin added on top of that spread before the next pass fires.
 RETRY_SETTLE_SECONDS = 300
+# Per-account give-up, so one dead provider doesn't hold the chain open all day
+# (other accounts keep going):
+#   * unreachable at pre-flight this many passes in a row. Retries of a down
+#     account are spaced by a growing backoff (30, then 60 minutes), so it is
+#     given up only after ~90 minutes of outage, not three quick passes.
+#   * or this many passes in a row clearing under LOW_PROGRESS_SHARE of what
+#     was sent: logins work but episode lookups fail (2026-10-27: every
+#     get_series_info a 502 while the pre-flight's login passed). Two in a row,
+#     because one pass can read low just by auditing before its tasks ran.
+UNREACHABLE_STRIKES_TO_GIVE_UP = 3
+UNREACHABLE_BACKOFF_SECONDS = 1800
+LOW_PROGRESS_SHARE = 0.10
+LOW_PROGRESS_PASSES = 2
+# A chain belongs to one sweep; never let one run into the next day's.
+CHAIN_MAX_AGE_SECONDS = 20 * 3600
 
 # A watched relation not episode-refreshed in this long is flagged as stale
 # (likely a provider error last cycle). Sized just over the daily cadence.
@@ -420,11 +439,16 @@ def _load_config(force: bool = False) -> dict:
     auto_retry = settings.get("auto_retry", DEFAULT_AUTO_RETRY)
     auto_retry = (auto_retry if isinstance(auto_retry, bool)
                   else str(auto_retry).lower() not in ("false", "0", "no", "off", ""))
+    # Read from a NEW setting id: 1.1.x's "retry_passes" (saved as 2 on most
+    # installs) meant a fixed count, and carrying it over would quietly cap
+    # the new until-done chain at two passes.
     try:
-        retry_passes = int(settings.get("retry_passes", DEFAULT_RETRY_PASSES))
+        retry_passes = int(settings.get("retry_max_passes", DEFAULT_RETRY_PASSES))
     except (TypeError, ValueError):
         retry_passes = DEFAULT_RETRY_PASSES
     retry_passes = max(0, min(MAX_RETRY_PASSES, retry_passes))
+    quiet_text = str(settings.get("retry_quiet_window") or "").strip()
+    quiet = parse_quiet_window(quiet_text)
 
     scheduled = settings.get("scheduled_sweep", True)
     scheduled = scheduled if isinstance(scheduled, bool) else str(scheduled).lower() not in ("false", "0", "no", "off", "")
@@ -446,6 +470,10 @@ def _load_config(force: bool = False) -> dict:
         "schedule_queue": queue,
         "auto_retry": auto_retry,
         "retry_passes": retry_passes,
+        # (start_minute, end_minute) of the day, or None. An unparseable value
+        # is treated as no window, and status shows it as BAD.
+        "quiet_window": quiet,
+        "quiet_window_text": quiet_text,
         "tiered": _as_bool(settings.get("tiered_refresh"), DEFAULT_TIERED),
         "provider_promotion": _as_bool(settings.get("provider_promotion"),
                                        DEFAULT_PROVIDER_PROMOTION),
@@ -496,7 +524,8 @@ def is_enabled() -> bool:
 
 def _empty_watchlist() -> dict:
     return {"series": {}, "last_sweep": None, "last_retry": None,
-            "chances": {}, "pending_new": [], "due": None, "misses": {}}
+            "chances": {}, "pending_new": [], "due": None, "misses": {},
+            "chain": None}
 
 
 def _read_watchlist_raw() -> dict:
@@ -519,7 +548,9 @@ def _read_watchlist_raw() -> dict:
 
     pending = val.get("pending_new")
     due = val.get("due")
+    chain = val.get("chain")
     return {
+        "chain": chain if isinstance(chain, dict) else None,
         "series": series,
         "last_sweep": val.get("last_sweep"),
         "last_retry": val.get("last_retry"),
@@ -629,6 +660,7 @@ def clear_watchlist() -> int:
         data["pending_new"] = []
         data["due"] = None
         data["misses"] = {}
+        data["chain"] = None   # a running retry chain stops at its next pass
         return True
 
     _mutate_watchlist(_mut)
@@ -1792,7 +1824,8 @@ def _prune_expired(ttl_seconds, visible=None):
     return pruned["n"]
 
 
-def _record_sweep_state(summary, due_pairs=None, misses=None, dispatched=None) -> None:
+def _record_sweep_state(summary, due_pairs=None, misses=None, dispatched=None,
+                        chain=None) -> None:
     """Persist a sweep's record, its due set and carried-over counts together,
     so staleness audits always read a due set that matches `last_sweep`.
 
@@ -1802,6 +1835,8 @@ def _record_sweep_state(summary, due_pairs=None, misses=None, dispatched=None) -
     """
     def _mut(data):
         data["last_sweep"] = summary
+        # Always written: a new sweep replaces (and so stops) any older chain.
+        data["chain"] = chain
         if due_pairs is not None:
             data["due"] = {"at_epoch": summary.get("at_epoch"), "pairs": due_pairs}
             data["misses"] = dict(misses or {})
@@ -1837,16 +1872,18 @@ def format_run_record(label, rec) -> str:
     """
     if not rec:
         return f"{label}: none yet"
-    bits = [str(rec.get("at", "?"))[:16]]   # minutes are enough here
+    # Month-day and minutes are enough here; the year was pure toast space.
+    bits = [str(rec.get("at", "?"))[5:16]]
     # No "watched" count here: the header already shows it, and the space is
     # needed (a sweep's count only differs from it by that day's TTL prune).
+    # Nor (1.2.0) the dispatch spread, "retry xN", an account count, or a
+    # retry's task count: the logs have them, any account that matters is
+    # named below, and the tier counts and chain state needed the room. The
+    # sweep keeps its task count, the one measure of how much a day costs.
     if rec.get("retried_series") is not None:
         bits.append(f"{rec['retried_series']} retried")
-    bits.append(f"{rec.get('accounts', 0)} acct")
-    bits.append(f"{rec.get('tasks', 0)} tasks")
-    # No dispatch spread or "retry xN" here (1.2.0): the header already shows
-    # the retry setting, both are in the logs, and the tier counts needed the
-    # room in the toast.
+    else:
+        bits.append(f"{rec.get('tasks', 0)} tasks")
     if rec.get("trigger"):
         bits.append(str(rec["trigger"]))
     out = f"{label}: " + " | ".join(bits)
@@ -1861,6 +1898,16 @@ def format_run_record(label, rec) -> str:
         out += f" | UNREACHABLE {', '.join(rec['skipped_names'])}"
     elif rec.get("skipped_accounts"):
         out += f" | UNREACHABLE {rec['skipped_accounts']}"
+    # Auto-retry chain (1.2.0): answers "is it done or still going?" without
+    # reading logs, and names any provider it stopped trying for the day.
+    if rec.get("held_names"):
+        out += f" | WAITING {', '.join(rec['held_names'])}"
+    if rec.get("gave_up_names"):
+        out += f" | GAVE UP {', '.join(rec['gave_up_names'])}"
+    if rec.get("next"):
+        out += f" | next {rec['next']}"
+    elif rec.get("done"):
+        out += " | done"
     return out
 
 
@@ -1880,8 +1927,12 @@ def build_status_message(cfg, watchlist, live, pid, active, id_mode=None,
       * the whole message is capped with a visible marker, so a future
         overrun announces itself instead of vanishing mid-field.
     """
-    retry = (f"x{cfg['retry_passes']}"
-             if cfg.get("auto_retry") and cfg.get("retry_passes") else "off")
+    if not (cfg.get("auto_retry") and cfg.get("retry_passes")):
+        retry = " retry=off"
+    elif cfg["retry_passes"] != DEFAULT_RETRY_PASSES:
+        retry = f" retry=x{cfg['retry_passes']}"
+    else:
+        retry = ""   # the default stays quiet, like the queue and TTL
     by_acct = ", ".join(
         f"{k} {v}" for k, v in sorted((live.get("by_account") or {}).items())
     )
@@ -1897,6 +1948,9 @@ def build_status_message(cfg, watchlist, live, pid, active, id_mode=None,
         extras += f" q={cfg['schedule_queue']}"
     if round(cfg["ttl_seconds"] / 86400.0) != DEFAULT_TTL_DAYS:
         extras += f" ttl={cfg['ttl_seconds'] / 86400.0:.0f}d"
+    if cfg.get("quiet_window_text"):
+        extras += (f" quiet {cfg['quiet_window_text']}" if cfg.get("quiet_window")
+                   else " quiet BAD")
     # Today's due set by tier (new / carried / hot / promoted / cold), from the
     # last sweep -- how much of the watchlist a run actually touches.
     due = (watchlist.get("last_sweep") or {}).get("due") or {}
@@ -1911,8 +1965,8 @@ def build_status_message(cfg, watchlist, live, pid, active, id_mode=None,
         f"watched={len(watchlist.get('series', {}))}"
         f"{(' tmdb ' + tmdb) if tmdb else ''}\n"
         f"sweep {cfg['sweep_hour']:02d}:00"
-        f"{'' if cfg['scheduled_sweep'] else ' AUTO-RUN OFF'} "
-        f"retry={retry} batch={cfg['batch_size']}/{cfg['spacing_seconds']:.0f}s"
+        f"{'' if cfg['scheduled_sweep'] else ' AUTO-RUN OFF'}{retry} "
+        f"batch={cfg['batch_size']}/{cfg['spacing_seconds']:.0f}s"
         f"{extras}{tiers}"
     )
 
@@ -2063,18 +2117,33 @@ def run_sweep_impl() -> dict:
         )
         dispatched = {s for sids in by_account.values() for s in sids}
 
-        # Arm the auto-retry chain. It must not audit until this sweep's tasks
-        # have actually RUN -- they carry countdowns up to spread_seconds -- so
-        # the first pass waits out the spread plus a settle margin. Recorded in
-        # the summary so "was a retry armed?" is answerable after the fact
-        # rather than only inferable from logs.
+        # Start the auto-retry chain. It must not audit until this sweep's
+        # tasks have actually RUN -- they carry countdowns up to spread_seconds
+        # -- so the first pass waits out the spread plus a settle margin. The
+        # sweep's own dispatch and pre-flight count as the chain's first
+        # observation: a provider unreachable now is already on its first
+        # strike. Recorded in the summary so "was a retry armed?" is
+        # answerable after the fact rather than only inferable from logs.
+        # Writing the chain (None when off) also retires any older one.
+        chain = None
         if cfg["auto_retry"] and cfg["retry_passes"] >= 1:
-            if schedule_auto_retry(
-                cfg["retry_passes"],
+            chain, _ = chain_record(
+                new_chain(summary["at_epoch"]),
+                {str(a): len(s) for a, s in by_account.items() if s},
+                [str(a) for a in summary["skipped_accounts"]],
+                {str(a): n for a, n in names.items() if n},
+                time.time(),
+            )
+            delay = quiet_adjusted_delay(
+                cfg["quiet_window"], _now_local(),
                 summary["spread_seconds"] + RETRY_SETTLE_SECONDS,
-                reason="after sweep",
-            ):
+            )
+            if schedule_auto_retry(1, delay, sweep_at=summary["at_epoch"],
+                                   reason="after sweep"):
                 summary["auto_retry_passes"] = cfg["retry_passes"]
+                chain["next_at"] = time.time() + delay
+            else:
+                chain["done"] = "could not schedule"
 
         # Keep the TMDB cache current for the NEXT run, after this run's
         # refreshes are queued so a slow TMDB never delays them.
@@ -2082,7 +2151,7 @@ def run_sweep_impl() -> dict:
             schedule_tmdb_refresh(TMDB_FIRST_DELAY_SECONDS, reason="after sweep")
 
         _record_sweep_state(summary, due_pairs=due_pairs, misses=misses,
-                            dispatched=dispatched)
+                            dispatched=dispatched, chain=chain)
         _write_debug_file(last_sweep=summary)
         logger.info(
             "[VOD-SWEEP] sweep done: %s watched, %s due %s, %s account(s), %s "
@@ -2103,11 +2172,179 @@ def run_sweep_impl() -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Stale-retry pass (manual, cheap counterpart to a full sweep)
+# Retry chain: until done, per-account give-up, optional quiet window (1.2.0)
 # --------------------------------------------------------------------------- #
+#
+# 1.1.x made a fixed two passes after the sweep. With a flaky provider that
+# left a tail for the operator to clear by hand, five clicks on a bad day. Now
+# the chain keeps going while anything is stale, and stops on its own when:
+#   * nothing is stale;
+#   * everything still stale belongs to accounts it has given up on for the
+#     day (see UNREACHABLE_STRIKES_TO_GIVE_UP / LOW_PROGRESS_PASSES);
+#   * the daily pass cap is reached, or the chain is older than
+#     CHAIN_MAX_AGE_SECONDS;
+#   * a newer sweep (or Clear watchlist) has replaced it.
+# The chain's state lives in the watchlist row under "chain", keyed to the
+# sweep that started it, so a pass from a superseded chain recognizes itself
+# and stops instead of running alongside the new one. Account ids are string
+# keys throughout: the row is JSON, and int keys come back as strings.
 
-def schedule_auto_retry(passes_left, after_seconds, reason="sweep") -> bool:
-    """Dispatch the next auto-retry pass, `after_seconds` from now.
+def parse_quiet_window(text):
+    """'HH:MM-HH:MM' -> (start_minute, end_minute) of the day, else None.
+
+    May wrap past midnight ('23:30-00:30'). Empty, malformed, or equal ends
+    all mean "no window": a typo must not silently stop every retry.
+    """
+    import re
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*", str(text or ""))
+    if not m:
+        return None
+    h1, m1, h2, m2 = (int(x) for x in m.groups())
+    if h1 > 23 or h2 > 23 or m1 > 59 or m2 > 59:
+        return None
+    start, end = h1 * 60 + m1, h2 * 60 + m2
+    return None if start == end else (start, end)
+
+
+def quiet_wait_seconds(window, now_dt):
+    """Seconds from `now_dt` until the quiet window ends; 0 outside it."""
+    if not window:
+        return 0
+    s, e = window[0] * 60, window[1] * 60
+    sec = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
+    if s < e:
+        return (e - sec) if s <= sec < e else 0
+    if sec >= s:                      # wraps midnight, before 00:00
+        return 86400 - sec + e
+    return (e - sec) if sec < e else 0
+
+
+def quiet_adjusted_delay(window, now_dt, delay):
+    """`delay`, pushed past the quiet window if the pass would start in it."""
+    from datetime import timedelta
+    delay = max(0, int(delay))
+    if not window:
+        return delay
+    return delay + quiet_wait_seconds(window, now_dt + timedelta(seconds=delay))
+
+
+def new_chain(sweep_at):
+    return {"sweep_at": sweep_at, "pass": 0, "sent": {}, "strikes": {},
+            "low": {}, "next_try": {}, "gave_up": {}, "names": {},
+            "next_at": None, "done": None}
+
+
+def chain_assess(chain, stale_by_id, now):
+    """Before a pass: score the previous pass's progress per account, and
+    pick the accounts to leave out of this one.
+
+    `chain["sent"]` is what the previous pass (or the sweep) dispatched per
+    account; whatever of it is still stale now did not clear. Returns
+    (chain, exclude_ids, held_ids, newly_given_up_ids). Held = unreachable
+    last time and still inside its backoff.
+    """
+    low = dict(chain.get("low") or {})
+    gave_up = dict(chain.get("gave_up") or {})
+    newly = []
+    for aid, n in (chain.get("sent") or {}).items():
+        n = int(n or 0)
+        if aid in gave_up or n <= 0:
+            continue
+        left = min(n, int(stale_by_id.get(aid, 0) or 0))
+        if (n - left) / float(n) < LOW_PROGRESS_SHARE:
+            low[aid] = int(low.get(aid, 0)) + 1
+            if low[aid] >= LOW_PROGRESS_PASSES:
+                gave_up[aid] = "no progress"
+                newly.append(aid)
+        else:
+            low.pop(aid, None)
+    held = sorted(
+        a for a, t in (chain.get("next_try") or {}).items()
+        if a not in gave_up and stale_by_id.get(a) and float(t) > now
+    )
+    chain = dict(chain, low=low, gave_up=gave_up)
+    return chain, set(gave_up) | set(held), held, newly
+
+
+def chain_record(chain, dispatched_by_id, unreachable_ids, names, now):
+    """After a pass: remember what went out (scored by the next pass) and
+    count pre-flight failures. Returns (chain, newly_given_up_ids).
+
+    An unreachable account is retried after a growing backoff rather than on
+    the next quick pass, so "3 strikes" spans ~90 minutes of real outage, and
+    a panel that is down briefly is not given up on in a quarter of an hour.
+    """
+    strikes = dict(chain.get("strikes") or {})
+    next_try = dict(chain.get("next_try") or {})
+    gave_up = dict(chain.get("gave_up") or {})
+    newly = []
+    for aid in dispatched_by_id:
+        strikes.pop(aid, None)
+        next_try.pop(aid, None)
+    for aid in unreachable_ids:
+        strikes[aid] = int(strikes.get(aid, 0)) + 1
+        if strikes[aid] >= UNREACHABLE_STRIKES_TO_GIVE_UP:
+            gave_up[aid] = "unreachable"
+            next_try.pop(aid, None)
+            newly.append(aid)
+        else:
+            next_try[aid] = now + UNREACHABLE_BACKOFF_SECONDS * 2 ** (strikes[aid] - 1)
+    known = dict(chain.get("names") or {})
+    known.update({str(k): str(v) for k, v in (names or {}).items() if v})
+    chain = dict(chain, sent={a: int(n) for a, n in dispatched_by_id.items() if n},
+                 strikes=strikes, next_try=next_try, gave_up=gave_up, names=known)
+    return chain, newly
+
+
+def chain_next(chain, stale_by_id, spread, passes_done, max_passes, now):
+    """Whether to run another pass, and when: (delay_seconds | None, reason).
+
+    `stale_by_id` is this pass's audit, taken before it dispatched.
+    """
+    gave_up = chain.get("gave_up") or {}
+    open_ids = [a for a, n in stale_by_id.items() if n and a not in gave_up]
+    if not open_ids:
+        return None, ("gave up on the rest" if any(stale_by_id.values())
+                      else "nothing stale")
+    if passes_done >= max_passes:
+        return None, "pass cap reached"
+    if chain.get("sent"):
+        # Wait out this pass's own dispatch spread before auditing again.
+        return int(spread) + RETRY_SETTLE_SECONDS, "retrying"
+    # Nothing went out: every open account is unreachable or backing off, so
+    # sleep until the first one is due rather than spending passes on it.
+    tries = [float(t) for a, t in (chain.get("next_try") or {}).items() if a in open_ids]
+    wait = (min(tries) - now) if tries else 0
+    return max(RETRY_SETTLE_SECONDS, int(wait)), "waiting on unreachable"
+
+
+def _chain_names(chain, ids):
+    names = chain.get("names") or {}
+    return [names.get(a, a) for a in sorted(ids)]
+
+
+def _set_chain(sweep_at, chain, summary=None) -> bool:
+    """Persist chain state (and, with `summary`, the pass's retry record in the
+    same write), but only if the chain is still the current one. Returns False
+    when a newer sweep or Clear watchlist has replaced it."""
+    ok = {"v": False}
+
+    def _mut(data):
+        current = data.get("chain")
+        if not isinstance(current, dict) or current.get("sweep_at") != sweep_at:
+            return False
+        data["chain"] = chain
+        if summary is not None:
+            data["last_retry"] = summary
+        ok["v"] = True
+        return True
+    _mutate_watchlist(_mut)
+    return ok["v"]
+
+
+def schedule_auto_retry(pass_no, after_seconds, sweep_at=None, reason="sweep") -> bool:
+    """Dispatch auto-retry pass `pass_no` of the chain started by the sweep at
+    `sweep_at`, `after_seconds` from now.
 
     Routed to the configured plugin-capable queue: a plugin `@shared_task` sent
     to the default prefork queue is rejected outright by that worker's consumer
@@ -2116,21 +2353,21 @@ def schedule_auto_retry(passes_left, after_seconds, reason="sweep") -> bool:
     itself is unaffected and the manual action still exists.
     """
     try:
-        passes_left = int(passes_left)
+        pass_no = int(pass_no)
     except (TypeError, ValueError):
         return False
-    if passes_left < 1:
+    if pass_no < 1:
         return False
     try:
         cfg = _load_config()
         queue = cfg["schedule_queue"]
         countdown = max(0, int(after_seconds))
         run_retry.apply_async(
-            args=[passes_left], countdown=countdown, queue=queue,
+            args=[pass_no, sweep_at], countdown=countdown, queue=queue,
         )
         logger.info(
-            "[VOD-SWEEP] auto-retry: %s pass(es) queued after %ss on queue '%s' (%s)",
-            passes_left, countdown, queue, reason,
+            "[VOD-SWEEP] auto-retry: pass %s queued after %ss on queue '%s' (%s)",
+            pass_no, countdown, queue, reason,
         )
         return True
     except Exception as exc:
@@ -2139,42 +2376,118 @@ def schedule_auto_retry(passes_left, after_seconds, reason="sweep") -> bool:
 
 
 @shared_task(name=RETRY_TASK_PATH)
-def run_retry(passes_left=1):
-    """One auto-retry pass, then chain the next if it is still worth doing.
+def run_retry(pass_no=1, sweep_at=None):
+    """One auto-retry pass, then schedule the next if it is still worth doing.
 
-    The chain ends when the passes are used up, or as soon as nothing is stale
-    -- a clean day costs a single audit and no provider calls at all. It keeps
-    going when relations ARE stale but every account was unreachable, since
-    that is precisely the case where waiting and trying again may recover.
+    See the section comment above for when the chain stops. A clean day costs
+    a single audit and no provider calls at all.
     """
     try:
-        passes_left = max(0, int(passes_left))
+        pass_no = max(1, int(pass_no))
     except (TypeError, ValueError):
-        passes_left = 0
+        pass_no = 1
+    out = {"skipped": None, "pass": pass_no}
+    try:
+        if sweep_at is None:
+            # Queued by a version before 1.2.0's chain (args = passes left).
+            out["skipped"] = "superseded"
+            logger.info("[VOD-SWEEP] auto-retry: pass from an older chain, ignored")
+            return out
+        cfg = _load_config(force=True)
+        chain = get_watchlist(force=True).get("chain")
+        if not isinstance(chain, dict) or chain.get("sweep_at") != sweep_at:
+            out["skipped"] = "superseded"
+            logger.info("[VOD-SWEEP] auto-retry: chain superseded by a newer sweep, stopping")
+            return out
+        if chain.get("done") or int(chain.get("pass") or 0) >= pass_no:
+            out["skipped"] = "already run"   # duplicate delivery
+            return out
+        now = time.time()
 
-    summary = retry_stale_impl(trigger=f"auto, {passes_left} left")
+        def _finish(reason):
+            _set_chain(sweep_at, dict(chain, done=reason, next_at=None))
+            logger.info("[VOD-SWEEP] auto-retry: chain ended (%s)", reason)
+            out["skipped"] = reason
+            return out
 
-    if summary.get("skipped") in ("plugin disabled", "watchlist empty"):
-        return summary
-    if not summary.get("stale_total"):
-        logger.info("[VOD-SWEEP] auto-retry: nothing stale, chain complete")
-        return summary
-    if passes_left > 1:
-        # Wait out this pass's own dispatch spread before auditing again.
-        schedule_auto_retry(
-            passes_left - 1,
-            summary.get("spread_seconds", 0) + RETRY_SETTLE_SECONDS,
-            reason="auto-retry chain",
+        if not cfg["auto_retry"] or cfg["retry_passes"] < 1:
+            return _finish("auto-retry turned off")
+        if now - float(sweep_at) > CHAIN_MAX_AGE_SECONDS:
+            return _finish("chain too old")
+        wait = quiet_wait_seconds(cfg["quiet_window"], _now_local())
+        if wait:
+            # Not a pass: same number, re-queued for when the window ends.
+            if schedule_auto_retry(pass_no, wait, sweep_at=sweep_at, reason="quiet window"):
+                _set_chain(sweep_at, dict(chain, next_at=now + wait))
+                out["skipped"] = "quiet window"
+                return out
+            return _finish("could not schedule")
+
+        state = {"chain": chain, "held": [], "newly": []}
+
+        def _hook(stale_by_id):
+            c, exclude, held, newly = chain_assess(state["chain"], stale_by_id, now)
+            state.update(chain=c, held=held, newly=newly)
+            return exclude
+
+        summary = retry_stale_impl(
+            trigger=f"auto {pass_no}/{cfg['retry_passes']}", chain_hook=_hook,
         )
-    else:
-        logger.info(
-            "[VOD-SWEEP] auto-retry: passes exhausted, %s relation(s) still stale %s",
-            summary.get("stale_total"), summary.get("stale_by_account"),
+        if summary.get("skipped") in ("plugin disabled", "watchlist empty"):
+            return _finish(summary["skipped"])
+
+        c, newly = chain_record(
+            state["chain"],
+            summary.get("dispatched_by_id") or {},
+            [str(a) for a in summary.get("skipped_accounts") or []],
+            summary.get("names_by_id") or {},
+            time.time(),
         )
-    return summary
+        c["pass"] = pass_no
+        given_up = state["newly"] + newly
+        if given_up:
+            logger.warning(
+                "[VOD-SWEEP] auto-retry: giving up for today on %s (%s); their "
+                "relations stay stale for tomorrow's sweep or a manual retry",
+                _chain_names(c, given_up),
+                ", ".join(sorted({c["gave_up"][a] for a in given_up})),
+            )
+        delay, reason = chain_next(c, summary.get("stale_by_id") or {},
+                                   summary.get("spread_seconds", 0), pass_no,
+                                   cfg["retry_passes"], time.time())
+        if delay is not None:
+            delay = quiet_adjusted_delay(cfg["quiet_window"], _now_local(), delay)
+            if schedule_auto_retry(pass_no + 1, delay, sweep_at=sweep_at, reason=reason):
+                c["next_at"] = time.time() + delay
+                summary["next"] = _fmt_epoch(c["next_at"])[11:16]
+            else:
+                c["done"], c["next_at"] = "could not schedule", None
+        else:
+            c["done"], c["next_at"] = reason, None
+            summary["done"] = True
+            logger.info(
+                "[VOD-SWEEP] auto-retry: chain complete after %s pass(es) (%s); "
+                "%s relation(s) still stale %s",
+                pass_no, reason, summary.get("stale_total"),
+                summary.get("stale_by_account"),
+            )
+        if c.get("gave_up"):
+            summary["gave_up_names"] = _chain_names(c, c["gave_up"])
+        if state["held"]:
+            summary["held_names"] = _chain_names(c, state["held"])
+        if not _set_chain(sweep_at, c, summary):
+            logger.info("[VOD-SWEEP] auto-retry: chain superseded mid-pass")
+        return summary
+    except Exception:
+        logger.exception("[VOD-SWEEP] auto-retry pass failed (ignored)")
+        return out
 
 
-def retry_stale_impl(trigger="manual") -> dict:
+# --------------------------------------------------------------------------- #
+# Stale-retry pass (manual, cheap counterpart to a full sweep)
+# --------------------------------------------------------------------------- #
+
+def retry_stale_impl(trigger="manual", chain_hook=None) -> dict:
     """Re-refresh ONLY the relations currently flagged stale.
 
     Why this exists: a provider panel that fails a fraction of its requests at
@@ -2186,6 +2499,12 @@ def retry_stale_impl(trigger="manual") -> dict:
 
     It does NOT touch the daily Redis claim, so it can never suppress the
     scheduled sweep. Fail-open throughout, like every other path here.
+
+    `chain_hook` is the auto-retry chain's: called with this audit's stale
+    counts per account id, it returns the account ids to leave out (given up
+    on, or backing off after a failed pre-flight). With a hook the caller
+    records the result, together with its chain state. A manual retry passes
+    none, so it always tries every account: the operator asked for it.
     """
     from django.db import close_old_connections
 
@@ -2195,7 +2514,10 @@ def retry_stale_impl(trigger="manual") -> dict:
         "stale_total": 0, "stale_by_account": {}, "stale_by_age": {},
         "retried_series": 0, "accounts": 0, "tasks": 0, "spread_seconds": 0,
         "skipped_accounts": [], "skipped": None,
+        # Per account id, for the chain (names can collide or change).
+        "stale_by_id": {}, "dispatched_by_id": {}, "names_by_id": {},
     }
+    record = _record_retry_result if chain_hook is None else (lambda _s: None)
     try:
         if not is_enabled():
             summary["skipped"] = "plugin disabled"
@@ -2215,11 +2537,14 @@ def retry_stale_impl(trigger="manual") -> dict:
         # its whole backlog, which would otherwise mask a real improvement
         # elsewhere in the total.
         rows = _stale_rows(pks)
-        counts = {}
+        counts, by_id = {}, {}
         for row in rows:
             name = row.get("m3u_account__name")
             counts[name] = counts.get(name, 0) + 1
+            aid = str(row.get("m3u_account_id"))
+            by_id[aid] = by_id.get(aid, 0) + 1
         summary["stale_by_account"] = counts
+        summary["stale_by_id"] = by_id
         summary["stale_total"] = len(rows)
         summary["stale_by_age"] = _stale_age_buckets(rows)
         # Worst-stale first: the longest-suffering relations are dispatched in
@@ -2228,19 +2553,24 @@ def retry_stale_impl(trigger="manual") -> dict:
         by_account = _stale_series_by_account(pks, rows=rows)
         if not by_account:
             summary["skipped"] = "nothing stale"
-            _record_retry_result(summary)
+            record(summary)
             logger.info("[VOD-SWEEP] retry: nothing stale, nothing to do")
             return summary
 
         names = {r.get("m3u_account_id"): r.get("m3u_account__name") for r in rows}
+        summary["names_by_id"] = {str(k): v for k, v in names.items() if v}
+        if chain_hook is not None:
+            exclude = chain_hook(dict(by_id)) or set()
+            by_account = {a: s for a, s in by_account.items() if str(a) not in exclude}
         by_account = _filter_reachable(by_account, summary, names)
         summary["accounts"] = len(by_account)
         summary["retried_series"] = sum(len(v) for v in by_account.values())
+        summary["dispatched_by_id"] = {str(a): len(s) for a, s in by_account.items() if s}
 
         summary["tasks"], summary["spread_seconds"] = _dispatch_refresh(
             by_account, cfg["batch_size"], cfg["spacing_seconds"],
         )
-        _record_retry_result(summary)
+        record(summary)
         logger.info(
             "[VOD-SWEEP] retry done: %s stale relation(s) %s, retried %s series "
             "across %s account(s), %s task(s) spread over ~%ss",

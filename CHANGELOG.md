@@ -37,9 +37,19 @@ left the ones that mattered stale. Works on Dispatcharr 0.32.0 and 0.33.0.
   run.
 - **Series new to the watchlist** have all their relations refreshed on the
   next run (the client's own first sync refreshes only the top-priority copy).
+- **Retry until done.** The automatic retry chain now keeps going until
+  nothing is stale instead of stopping after two passes. A provider that stays
+  unreachable (about 90 minutes, retried with a growing backoff) or makes no
+  progress for two passes in a row is given up for the day, and the others
+  carry on. A daily cap (12 passes by default) and a 20-hour limit bound it,
+  and a newer sweep or Clear watchlist stops an older chain.
+- **Quiet window for retries** (optional, off by default): a time range, such
+  as your client's library sync, when automatic retries make no provider calls.
 - **Update TMDB schedules** action, and new settings: Refresh by airing status,
   TMDB API key, Airing window, Rotation for other shows, Refresh when a provider
-  reports a change, Fallback airing window.
+  reports a change, Fallback airing window, Max retry passes per day, Quiet
+  window for retries. *Max retry passes per day* replaces *Retry passes*, which
+  was a fixed count; the old setting is ignored.
 
 ### Changed
 
@@ -55,18 +65,23 @@ left the ones that mattered stale. Works on Dispatcharr 0.32.0 and 0.33.0.
 - **Priority order** now applies to the sweep as well as retries, and across
   accounts: one provider's rotation work never queues ahead of another's new or
   airing shows. Retries also try airing shows before rotation ones.
-- **Show status** adds TMDB coverage and the due set by tier, names unreachable
-  providers instead of showing their database id, and drops the dispatch
-  spread and default queue/TTL from the summary to stay within the result
-  toast.
+- **Show status** adds TMDB coverage, the due set by tier and the retry
+  chain's progress (`auto 4/12`, `next 10:42` or `done`, and any provider it is
+  `WAITING` on or `GAVE UP` on), and names unreachable providers instead of
+  showing their database id. To stay within the result toast it drops the
+  dispatch spread, account counts, a retry's task count, the year, and
+  default retry/queue/TTL settings.
 
 ### Tests
 
-- 216 → 342 checks: tier assignment, the noise guard, TMDB schedule and
+- 216 → 425 checks: tier assignment, the noise guard, TMDB schedule and
   sanity rules, priority and cross-account interleaving, carried-over work,
   the new stale definition, ignored-refresh expiry, TMDB lookups (budget,
-  re-queue, rejected key, rate limit, key never logged), and an end-to-end
-  tiered sweep. Each new guard was mutation-checked.
+  re-queue, rejected key, rate limit, key never logged), an end-to-end
+  tiered sweep, and the retry chain (progress and unreachable give-up,
+  backoff, cap, superseded and duplicate passes, quiet window including one
+  crossing midnight, and a provider down all day end to end). Each new guard
+  was mutation-checked.
 
 ## [1.1.1] - 2026-10-27
 
