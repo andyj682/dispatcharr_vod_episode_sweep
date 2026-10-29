@@ -67,16 +67,43 @@ class Plugin:
 
     fields = [
         {
-            "id": "sweep_hour",
-            "label": "Earliest sweep hour (0-23)",
-            "type": "number",
-            "default": 3,
+            "id": "tiered_refresh",
+            "label": "Prioritize refresh by airing status",
+            "type": "boolean",
+            "default": True,
             "help_text": (
-                "Hour the daily sweep runs, in Dispatcharr's configured system "
-                "timezone. With Auto-run daily sweep on (below), a timer fires the "
-                "sweep at this hour; otherwise it fires on the first client series "
-                "request at/after this hour. Set it a bit BEFORE your client's "
-                "daily sync so new episodes are ready in one pass. Default 3."
+                "Refresh shows that are airing every day, and everything else on "
+                "a rotation (plus anything new, carried over, or reported changed "
+                "by its provider). Most watched shows aren't airing, so this cuts "
+                "the daily provider load sharply. Off = refresh every watched "
+                "show every day, as before 1.2.0."
+            ),
+        },
+        {
+            "id": "provider_promotion",
+            "label": "Refresh when a provider reports a change",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "Refresh a show the day its provider's listing says it changed "
+                "since the last refresh, whatever its airing status. Catches what "
+                "no schedule shows: a new copy of an old show, backfilled "
+                "seasons, fixed episodes. Ignored for a provider that marks most "
+                "of its listing changed at once. Default on."
+            ),
+        },
+        {
+            "id": "tmdb_api_key",
+            "label": "TMDB API key (optional)",
+            "type": "string",
+            "default": "",
+            "help_text": (
+                "A free TMDB key (v3 API key or v4 read access token) lets the "
+                "plugin follow each show's airing schedule: refreshed daily "
+                "around new episodes, and from a few days before a new season "
+                "starts. Only TMDB ids are sent. Without a key, stored episode "
+                "air dates are used instead. Falls back to Dispatcharr's "
+                "TMDB_API_KEY environment variable if that is set."
             ),
         },
         {
@@ -85,10 +112,23 @@ class Plugin:
             "type": "boolean",
             "default": True,
             "help_text": (
-                "Automatically run the daily sweep on a timer at the hour above. "
+                "Automatically run the daily sweep on a timer at the hour below. "
                 "When off, it still runs -- but only when a client next requests a "
                 "series after that hour, which lags new episodes by an extra sync. "
                 "Leave on unless you have a reason not to."
+            ),
+        },
+        {
+            "id": "sweep_hour",
+            "label": "Earliest sweep hour (0-23)",
+            "type": "number",
+            "default": 3,
+            "help_text": (
+                "Hour the daily sweep runs, in Dispatcharr's configured system "
+                "timezone. With Auto-run daily sweep on (above), a timer fires the "
+                "sweep at this hour; otherwise it fires on the first client series "
+                "request at/after this hour. Set it a bit BEFORE your client's "
+                "daily sync so new episodes are ready in one pass. Default 3."
             ),
         },
         {
@@ -128,33 +168,6 @@ class Plugin:
             ),
         },
         {
-            "id": "tiered_refresh",
-            "label": "Refresh by airing status",
-            "type": "boolean",
-            "default": True,
-            "help_text": (
-                "Refresh shows that are airing every day, and everything else on "
-                "a rotation (plus anything new, carried over, or reported changed "
-                "by its provider). Most watched shows aren't airing, so this cuts "
-                "the daily provider load sharply. Off = refresh every watched "
-                "show every day, as before 1.2.0."
-            ),
-        },
-        {
-            "id": "tmdb_api_key",
-            "label": "TMDB API key (optional)",
-            "type": "string",
-            "default": "",
-            "help_text": (
-                "A free TMDB key (v3 API key or v4 read access token) lets the "
-                "plugin follow each show's airing schedule: refreshed daily "
-                "around new episodes, and from a few days before a new season "
-                "starts. Only TMDB ids are sent. Without a key, stored episode "
-                "air dates are used instead. Falls back to Dispatcharr's "
-                "TMDB_API_KEY environment variable if that is set."
-            ),
-        },
-        {
             "id": "hot_aired_days",
             "label": "Airing window (days)",
             "type": "number",
@@ -174,19 +187,6 @@ class Plugin:
                 "Shows that aren't airing are still refreshed at least once every "
                 "this many days (1-28), spread evenly across the days. Lower = "
                 "fresher, more provider calls. Default 7."
-            ),
-        },
-        {
-            "id": "provider_promotion",
-            "label": "Refresh when a provider reports a change",
-            "type": "boolean",
-            "default": True,
-            "help_text": (
-                "Refresh a show the day its provider's listing says it changed "
-                "since the last refresh, whatever its airing status. Catches what "
-                "no schedule shows: a new copy of an old show, backfilled "
-                "seasons, fixed episodes. Ignored for a provider that marks most "
-                "of its listing changed at once. Default on."
             ),
         },
         {
@@ -364,7 +364,7 @@ class Plugin:
                                    "TMDB_API_KEY environment variable)."}
             if not cfg.get("tiered"):
                 return {"status": "error",
-                        "message": "Refresh by airing status is off, so TMDB "
+                        "message": "Prioritize refresh by airing status is off, so TMDB "
                                    "schedules aren't used."}
             ok = _patch.schedule_tmdb_refresh(0, reason="manual")
             return {

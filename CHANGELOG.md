@@ -13,7 +13,7 @@ left the ones that mattered stale. Works on Dispatcharr 0.32.0 and 0.33.0.
 
 ### Added
 
-- **Refresh by airing status** (on by default). Each run refreshes what is
+- **Prioritize refresh by airing status** (on by default). Each run refreshes what is
   *due*, in priority order: relations never refreshed and series new to the
   watchlist; anything due on an earlier run and still not refreshed; shows that
   are airing; shows whose provider reports a change; and a rotating slice of
@@ -45,7 +45,7 @@ left the ones that mattered stale. Works on Dispatcharr 0.32.0 and 0.33.0.
   and a newer sweep or Clear watchlist stops an older chain.
 - **Quiet window for retries** (optional, off by default): a time range, such
   as your client's library sync, when automatic retries make no provider calls.
-- **Update TMDB schedules** action, and new settings: Refresh by airing status,
+- **Update TMDB schedules** action, and new settings: Prioritize refresh by airing status,
   TMDB API key, Airing window, Rotation for other shows, Refresh when a provider
   reports a change, Fallback airing window, Max retry passes per day, Quiet
   window for retries. *Max retry passes per day* replaces *Retry passes*, which

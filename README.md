@@ -90,21 +90,21 @@ refresh task — so there's no separate Celery/beat setup to worry about.)
 
 | Field | Default | Meaning |
 |---|---|---|
-| **Earliest sweep hour (0-23)** | 3 | Hour the daily sweep runs, in **Dispatcharr's configured system timezone** (not the container's UTC clock). With Auto-run daily sweep on, a beat timer fires it at this hour; otherwise it fires on the first client series request at/after it. Set it a bit *before* your client's daily sync. |
-| **Watchlist TTL (days)** | 30 | A series leaves the watchlist only after this long unseen **and** after your client has ignored 3 refreshes of it — or after 120 days unseen regardless. See note 7. |
+| **Prioritize refresh by airing status** | on | Refresh airing shows daily and everything else on a rotation (plus anything new, carried over, or reported changed by its provider). Off = every watched show every day, as before 1.2.0. |
+| **Refresh when a provider reports a change** | on | Refresh a show the day its provider's listing says it changed since the last refresh, whatever its airing status — catches new copies of old shows and backfilled seasons. Ignored for a provider that marks most of its listing changed at once. |
+| **TMDB API key (optional)** | — | A free TMDB key (v3 API key or v4 read access token). Lets the plugin follow each show's airing schedule, including pre-warming a show a few days before a new season. Only TMDB ids are sent. Falls back to Dispatcharr's `TMDB_API_KEY` environment variable; without either, stored episode air dates are used. |
 | **Auto-run daily sweep** | on | Run the sweep on a fixed daily timer (Celery beat) rather than waiting for client traffic — so it runs *before* your sync and new episodes appear in **one** sync instead of two. Off = opportunistic (traffic-triggered) only. |
+| **Earliest sweep hour (0-23)** | 3 | Hour the daily sweep runs, in **Dispatcharr's configured system timezone** (not the container's UTC clock). With Auto-run daily sweep on, a beat timer fires it at this hour; otherwise it fires on the first client series request at/after it. Set it a bit *before* your client's daily sync. |
 | **Auto-retry stale relations** | on | After each sweep, keep re-refreshing whatever is still flagged stale until nothing is, then stop — the same work the Retry action does. Useful when a provider intermittently fails requests, since a later pass may succeed where the first didn't. A provider that stays unreachable (about 90 minutes, retried with a growing backoff) or makes no progress for two passes is given up for the day; the others carry on. Costs nothing on a clean day: one audit, no provider calls. |
 | **Max retry passes per day** | 12 | Upper limit on automatic passes (0–24). The chain normally stops well before it. 0 turns auto-retry off. (Replaces 1.1.x's *Retry passes*, a fixed count; the old setting is ignored.) |
 | **Quiet window for retries (optional)** | — | A time range like `09:55-10:15` when automatic retries make no provider calls; a pass due inside it waits until it ends. Use it to keep retries out of your client's library sync, starting it a few minutes early. May cross midnight. |
-| **Refresh by airing status** | on | Refresh airing shows daily and everything else on a rotation (plus anything new, carried over, or reported changed by its provider). Off = every watched show every day, as before 1.2.0. |
-| **TMDB API key (optional)** | — | A free TMDB key (v3 API key or v4 read access token). Lets the plugin follow each show's airing schedule, including pre-warming a show a few days before a new season. Only TMDB ids are sent. Falls back to Dispatcharr's `TMDB_API_KEY` environment variable; without either, stored episode air dates are used. |
 | **Airing window (days)** | 10 | How long after an episode airs (per TMDB) a show stays on the daily refresh — covers providers posting late. |
 | **Rotation for other shows (days)** | 7 | Shows that aren't airing are still refreshed at least this often (1–28), spread evenly across the days. |
-| **Refresh when a provider reports a change** | on | Refresh a show the day its provider's listing says it changed since the last refresh, whatever its airing status — catches new copies of old shows and backfilled seasons. Ignored for a provider that marks most of its listing changed at once. |
 | **Fallback airing window (days)** | 14 | For shows without usable TMDB data: daily while a stored episode air date (or a newly appeared episode) is within this many days. |
-| **Schedule queue (advanced)** | `dvr` | The Celery queue the scheduled sweep is dispatched to; must be served by a worker that loads plugins (stock Dispatcharr = the threads-pool `dvr` worker). Change only if your worker layout differs. |
+| **Watchlist TTL (days)** | 30 | A series leaves the watchlist only after this long unseen **and** after your client has ignored 3 refreshes of it — or after 120 days unseen regardless. See note 7. |
 | **Refresh batch size** | 20 | Series per background refresh task — smaller = smaller provider bursts. 0 = one task per account. |
 | **Refresh spacing (seconds)** | 15 | Delay between successive refresh batches (Celery countdown), to spread provider calls. 0 = all at once. |
+| **Schedule queue (advanced)** | `dvr` | The Celery queue the scheduled sweep is dispatched to; must be served by a worker that loads plugins (stock Dispatcharr = the threads-pool `dvr` worker). Change only if your worker layout differs. |
 
 The watchlist builds itself from observed `get_series_info` calls — no manual
 list. Only Xtream-Codes VOD series are affected.
@@ -185,7 +185,7 @@ required.
    by Dispatcharr's listing scan, so they're not needed here. Live TV/EPG/DVR
    untouched.
 3. **Provider API budget.** Each refreshed series costs ~one `get_series_info`
-   call per relation per account. With **Refresh by airing status** on, a day
+   call per relation per account. With **Prioritize refresh by airing status** on, a day
    touches only what is due — typically a small fraction of the watchlist. If
    a provider rate-limits you, lower **Refresh batch size** and/or raise
    **Refresh spacing** to spread the calls out.
@@ -210,7 +210,7 @@ required.
    happened, run **Clear watchlist** once on 1.1.1, then let your client do a
    full resync so the list rebuilds. Your client may have its own steps for
    this change, since any series ids it stored also change meaning.
-7. **Refresh by airing status (1.2.0).** Each run refreshes what is *due*:
+7. **Prioritize refresh by airing status (1.2.0).** Each run refreshes what is *due*:
    new and carried-over work first, then airing shows, then shows a provider
    reports changed, then a rotating slice of the rest. TMDB's schedule decides
    what is airing; the provider's own change date is an independent override
@@ -219,7 +219,7 @@ required.
    never which shows are watched. Because a show off the daily refresh is
    bumped less often, the watchlist no longer expires on time alone: a show is
    dropped only when your client has ignored 3 refreshes of it and it is past
-   the TTL (or after 120 days unseen). Turn **Refresh by airing status** off to
+   the TTL (or after 120 days unseen). Turn **Prioritize refresh by airing status** off to
    get the pre-1.2.0 refresh behavior back exactly.
 
 ## Storage
