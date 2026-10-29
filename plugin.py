@@ -59,9 +59,8 @@ class Plugin:
     version = "1.2.0"
     description = (
         "Learns which VOD series a client syncs and refreshes ALL of each watched "
-        "show's provider/category relations so new episodes stop going missing: "
-        "airing shows daily, the rest on a rotation. Scoped to only the series "
-        "you sync; runs in the background."
+        "show's provider/category relations so new episodes stop going missing. "
+        "Scoped to only the series you sync; runs in the background."
     )
     author = "andyj682"
     help_url = "https://github.com/andyj682/dispatcharr_vod_episode_sweep"
