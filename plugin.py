@@ -286,12 +286,9 @@ class Plugin:
         {
             "id": "tmdb_refresh",
             "label": "Update TMDB schedules",
-            "description": (
-                "Look up airing schedules on TMDB now (runs in the background; "
-                "needs a TMDB key). Also happens automatically after each sweep."
-            ),
+            "description": "Look up airing schedules on TMDB now.",
             "button_label": "Update TMDB",
-            "button_variant": "outline",
+            "button_variant": "filled",
         },
         {
             "id": "clear_watchlist",
