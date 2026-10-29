@@ -4,6 +4,70 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-10-28
+
+Refreshes what can actually have changed instead of everything, every day.
+In practice most watched shows are not airing, so most of each day's provider
+calls went to shows that could not have new episodes, while a flaky provider
+left the ones that mattered stale. Works on Dispatcharr 0.32.0 and 0.33.0.
+
+### Added
+
+- **Refresh by airing status** (on by default). Each run refreshes what is
+  *due*, in priority order: relations never refreshed and series new to the
+  watchlist; anything due on an earlier run and still not refreshed; shows that
+  are airing; shows whose provider reports a change; and a rotating slice of
+  everything else (every show at least weekly by default, plus anything past
+  its rotation). Turning it off restores the 1.1.x behavior exactly.
+- **TMDB schedules (optional).** With a free TMDB key, "airing" follows each
+  show's schedule: daily for 10 days after an episode airs, and from 3 days
+  before the next one, so a returning show is ready for its premiere and a show
+  on a break isn't refreshed daily. Lookups run in the background after the
+  sweep, cached and re-checked every 2 days for airing shows, weekly for
+  returning ones and monthly for ended ones; only TMDB ids are sent. TMDB ids
+  that don't match the show (by first-air year and title) are ignored. Without
+  a key, or for shows TMDB has nothing usable for, stored episode air dates
+  decide. Falls back to Dispatcharr's `TMDB_API_KEY` environment variable.
+- **Provider-change promotion.** A show whose provider listing reports a
+  change since its last refresh is refreshed that day on that provider,
+  whatever its airing status. This catches what no schedule shows: a new copy
+  of an old show, backfilled seasons, fixed episodes. It reads what
+  Dispatcharr's catalog refresh already stored, so it costs no provider calls.
+  A provider that marks most of its listing changed at once is ignored for the
+  run.
+- **Series new to the watchlist** have all their relations refreshed on the
+  next run (the client's own first sync refreshes only the top-priority copy).
+- **Update TMDB schedules** action, and new settings: Refresh by airing status,
+  TMDB API key, Airing window, Rotation for other shows, Refresh when a provider
+  reports a change, Fallback airing window.
+
+### Changed
+
+- **Watchlist expiry.** A series is now dropped only after the TTL **and** after
+  the client has ignored 3 refreshes of it (or after 120 days unseen
+  regardless). The TTL alone assumed every show was refreshed daily; with
+  tiering an old show is refreshed weekly at best, and only when its top
+  provider answers, so a time-only rule would have dropped shows still
+  followed. A failed refresh never counts against a show.
+- **"Stale" now means due and not yet refreshed.** A show that isn't due today
+  never counts as stale. The age buckets count runs missed (`age(runs)`), not
+  days elapsed. With no due set recorded yet, the 1.1.x definition applies.
+- **Priority order** now applies to the sweep as well as retries, and across
+  accounts: one provider's rotation work never queues ahead of another's new or
+  airing shows. Retries also try airing shows before rotation ones.
+- **Show status** adds TMDB coverage and the due set by tier, names unreachable
+  providers instead of showing their database id, and drops the dispatch
+  spread and default queue/TTL from the summary to stay within the result
+  toast.
+
+### Tests
+
+- 216 → 342 checks: tier assignment, the noise guard, TMDB schedule and
+  sanity rules, priority and cross-account interleaving, carried-over work,
+  the new stale definition, ignored-refresh expiry, TMDB lookups (budget,
+  re-queue, rejected key, rate limit, key never logged), and an end-to-end
+  tiered sweep. Each new guard was mutation-checked.
+
 ## [1.1.1] - 2026-10-27
 
 Required for Dispatcharr 0.33.0, and still works on earlier releases. Update

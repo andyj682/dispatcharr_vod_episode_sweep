@@ -133,7 +133,11 @@ class RelQS:
         self.rows = rows
 
     def values(self, *fields):
-        return RelQS([{f: r[f] for f in fields} for r in self.rows])
+        # Columns a scenario didn't seed read as None (a never-refreshed
+        # relation, no provider date, no account name), which is what the
+        # real rows hold for a relation the catalog/episode refresh hasn't
+        # touched yet.
+        return RelQS([{f: r.get(f) for f in fields} for r in self.rows])
 
     def values_list(self, field, flat=False):
         vals = [r[field] for r in self.rows]
@@ -625,7 +629,10 @@ def test_wrapper_passthrough():
     reset()
     seed_relations()
     patch._orig_xc_get_series_info = lambda request, user, series_id: ("NATIVE", series_id)
-    out = patch.patched_xc_get_series_info("req", "user", 11)
+    # Tick stubbed: left live it spawns a real background sweep that can
+    # finish after the NEXT test has reset the environment, and write into it.
+    with stubbed_tick():
+        out = patch.patched_xc_get_series_info("req", "user", 11)
     check("wrapper returns the native response unchanged", out == ("NATIVE", 11))
     check("wrapper still recorded the series", "100" in patch.get_watchlist(force=True)["series"])
 
@@ -655,18 +662,37 @@ def test_sweep_enqueues_per_account():
 
 
 def test_ttl_prune():
+    """1.2.0: unseen for the TTL is no longer enough on its own. With tiered
+    refresh an old show is bumped weekly at best (and only when its top
+    provider answers), so a time-only rule would drop shows still followed."""
     print("test_ttl_prune")
     reset(settings={"watchlist_ttl_days": 30})
     seed_relations()
     patch._observe(11)   # series 100 at t0
-    CLOCK.advance(40 * 86400)  # 40 days later
+    CLOCK.advance(40 * 86400)  # 40 days later, and no bump ever reached the client
     patch._observe(21)   # series 200 now (fresh)
-    summary = patch.run_sweep_impl()
+    saved = patch._visible_bumps
+    patch._visible_bumps = lambda pks: {}
+    try:
+        summary = patch.run_sweep_impl()
+    finally:
+        patch._visible_bumps = saved
     wl = patch.get_watchlist(force=True)["series"]
-    check("stale series (40d) pruned", "100" not in wl)
+    check("40 days unseen but never given a chance to re-sync: kept", "100" in wl)
     check("fresh series kept", "200" in wl)
-    check("summary records prune", summary["pruned"] == 1)
-    check("only the fresh series is refreshed", [a for a, _ in ENV.enqueued] == [7])
+    check("summary records no prune", summary["pruned"] == 0)
+
+    CLOCK.advance((patch.EXPIRY_CEILING_DAYS - 40 + 1) * 86400)
+    patch._observe(21)
+    patch._visible_bumps = lambda pks: {}
+    try:
+        summary = patch.run_sweep_impl()
+    finally:
+        patch._visible_bumps = saved
+    wl = patch.get_watchlist(force=True)["series"]
+    check("unseen past the ceiling: pruned regardless", "100" not in wl)
+    check("summary records the prune", summary["pruned"] == 1)
+    check("still-seen series kept", "200" in wl)
 
 
 def test_disabled_noops():
@@ -1458,6 +1484,7 @@ def test_status_message_fits_the_ui_box():
             "tasks": 116, "spread_seconds": 1725, "stale_total": 911,
             "stale_by_account": {n: 100 for n in names},
             "auto_retry_passes": 2, "skipped_accounts": [], "skipped": None,
+            "due": {"n": 12, "r": 210, "h": 341, "p": 25, "c": 1436},
         },
         "last_retry": {
             "at": "2026-10-05 12:26:57", "retried_series": 683, "accounts": 8,
@@ -1473,7 +1500,7 @@ def test_status_message_fits_the_ui_box():
           all(n in msg for n in names))
     check("live audit comes before the stored records",
           msg.index("STALE NOW") < msg.index("last sweep"))
-    check("age buckets present", "age(cycles)" in msg)
+    check("age buckets present", "age(runs)" in msg)
     check("stored records do not repeat the per-account split",
           msg.count("Provider1 ") == 1)
 
@@ -1494,7 +1521,7 @@ def test_status_message_fits_the_ui_box():
                            trigger="auto, 1 left"),
     }
     msg4 = patch.build_status_message(cfg, wl4, live4, 27300, True,
-                                      id_mode="relation")
+                                      id_mode="relation", tmdb="1188/1196")
     check("a bad 4-account day fits without clipping (len=%d)" % len(msg4),
           len(msg4) <= patch.STATUS_MAX_CHARS and not msg4.endswith(" ..."))
     check("  ...including the last retry's stale count",
@@ -1800,6 +1827,594 @@ def test_enqueue_failure_tolerated():
     check("nothing recorded as enqueued", ENV.enqueued == [])
 
 
+# --------------------------------------------------------------------------- #
+# 1.2.0: tiered refresh, TMDB, watchlist expiry
+# --------------------------------------------------------------------------- #
+from datetime import date as _date, datetime as _dt, timedelta as _td, timezone as _utc_tz
+
+_DAY = 86400.0
+_TODAY = _date(2026, 11, 2)
+_NOW = _dt(2026, 11, 2, 8, 0, 0, tzinfo=_utc_tz.utc).timestamp()
+_LM = patch.PROVIDER_LM_FIELD
+
+
+def _rel(aid, sid, ler=None, lm=None):
+    """A watched relation row as _relation_rows returns it (epochs for dates)."""
+    return {"m3u_account_id": aid, "m3u_account__name": "Provider%d" % aid,
+            "series_id": sid, "last_episode_refresh": ler, _LM: lm}
+
+
+def _slot_ids(n_on, n_off, rotation=7, start=1000):
+    """Series ids on / off today's rotation slot."""
+    slot = _TODAY.toordinal() % rotation
+    on = [i for i in range(start, start + 200) if i % rotation == slot][:n_on]
+    off = [i for i in range(start, start + 200) if i % rotation != slot][:n_off]
+    return on, off
+
+
+def _cfg(**kw):
+    reset(settings=kw)
+    return patch._load_config(force=True)
+
+
+def test_compute_due_tiers():
+    print("test_compute_due_tiers")
+    cfg = _cfg()
+    (on1,), (newb, pend, carried, hotb, promo, offslot, overdue) = _slot_ids(1, 7)
+    y = _NOW - _DAY           # refreshed yesterday
+    rows = [
+        _rel(7, newb, ler=None),                         # never refreshed
+        _rel(7, pend, ler=y),                            # new to the watchlist
+        _rel(7, carried, ler=y),                         # missed an earlier run
+        _rel(7, hotb, ler=y),                            # airing
+        _rel(7, promo, ler=y, lm=str(int(y + 3600))),    # provider changed it
+        _rel(9, promo, ler=y),                           # ...on account 7 only
+        _rel(7, on1, ler=_NOW - 3 * _DAY),               # cold, its slot today
+        _rel(7, offslot, ler=y),                         # cold, not today
+        _rel(7, overdue, ler=_NOW - 10 * _DAY),          # cold, past rotation+slack
+    ]
+    due, noisy = patch.compute_due(
+        rows, {hotb}, cfg, _TODAY, _NOW, pending_new=[str(pend)],
+        misses={patch._pair_key(7, carried): 1})
+    check("never-refreshed relation is new", due.get((7, newb)) == "n")
+    check("series new to the watchlist is new", due.get((7, pend)) == "n")
+    check("missed earlier run is carried", due.get((7, carried)) == "r")
+    check("airing series is hot", due.get((7, hotb)) == "h")
+    check("provider-changed copy is promoted", due.get((7, promo)) == "p")
+    check("...but only on the account that changed it", (9, promo) not in due)
+    check("cold series on its slot is due", due.get((7, on1)) == "c")
+    check("cold series off its slot is not due", (7, offslot) not in due)
+    check("cold series past its rotation is due anyway", due.get((7, overdue)) == "c")
+    check("no provider flagged as noisy", noisy == set())
+
+    off = _cfg(tiered_refresh=False)
+    due_off, _ = patch.compute_due(rows, {hotb}, off, _TODAY, _NOW)
+    check("tiers off: every pair is due (1.1.x behavior)",
+          len(due_off) == len({(r["m3u_account_id"], r["series_id"]) for r in rows}))
+
+    nopromo = _cfg(provider_promotion=False)
+    due_np, _ = patch.compute_due(rows, set(), nopromo, _TODAY, _NOW)
+    check("promotion off: changed copy waits for its slot", (7, promo) not in due_np)
+
+    junk = [_rel(7, promo, ler=y, lm="0"), _rel(7, offslot, ler=y, lm=str(int(_NOW * 1000)))]
+    due_j, _ = patch.compute_due(junk, set(), cfg, _TODAY, _NOW)
+    check("junk provider dates (zero, milliseconds) are ignored", due_j == {})
+
+
+def test_promotion_noise_guard():
+    print("test_promotion_noise_guard")
+    cfg = _cfg()
+    _, off = _slot_ids(0, 60)
+    y = _NOW - _DAY
+    loud = [_rel(7, s, ler=y, lm=str(int(y + 60))) for s in off[:40]]
+    loud += [_rel(7, s, ler=y) for s in off[40:50]]
+    due, noisy = patch.compute_due(loud, set(), cfg, _TODAY, _NOW)
+    check("a provider marking most of its listing changed is ignored", noisy == {7})
+    check("...so none of its copies is promoted", not any(t == "p" for t in due.values()))
+
+    small = [_rel(9, s, ler=y, lm=str(int(y + 60))) for s in off[50:55]]
+    due_s, noisy_s = patch.compute_due(small, set(), cfg, _TODAY, _NOW)
+    check("a small provider's few real changes still promote",
+          noisy_s == set() and all(t == "p" for t in due_s.values()) and len(due_s) == 5)
+
+
+def test_tmdb_schedule_rules():
+    print("test_tmdb_schedule_rules")
+    A = 10
+    d = lambda n: (_TODAY + _td(days=n)).isoformat()
+    check("aired 3 days ago: hot", patch.tmdb_hot({"last": d(-3)}, _TODAY, A))
+    check("aired 20 days ago, nothing scheduled: not hot",
+          not patch.tmdb_hot({"last": d(-20)}, _TODAY, A))
+    check("next episode in 2 days: hot", patch.tmdb_hot({"next": d(2)}, _TODAY, A))
+    check("next episode in 10 days: not hot yet",
+          not patch.tmdb_hot({"last": d(-30), "next": d(10)}, _TODAY, A))
+    check("cached 'next' already passed (cache behind the premiere): still hot",
+          patch.tmdb_hot({"last": d(-60), "next": d(-4)}, _TODAY, A))
+    check("no dates: not hot", not patch.tmdb_hot({"st": "Ended"}, _TODAY, A))
+
+    sane = patch.tmdb_sane
+    check("decorated provider title matches TMDB title",
+          sane("EN - Harbor of the Lake (US)", 2013, {"name": "Harbor of the Lake", "year": 2013}))
+    check("matches on the original title too",
+          sane("NF - La Torre Roja (MULTI SUB)", None, {"name": "The Red Tower", "oname": "La torre roja"}))
+    check("year off by more than one: rejected",
+          not sane("EN - Some Show", 2010, {"name": "Some Show", "year": 2019}))
+    check("no shared words: rejected",
+          not sane("EN - Garden Mysteries", None, {"name": "Space Pirates"}))
+    check("a title with no usable words passes on the year",
+          sane("42", 2001, {"name": "42", "year": 2001}))
+    check("an error entry is never sane", not sane("Show", None, {"err": "not_found"}))
+
+    rc = lambda e: patch.tmdb_recheck_seconds(e, _TODAY, A) / _DAY
+    check("hot show re-checked every 2 days", rc({"last": d(-2)}) == 2)
+    check("premiere within 14 days re-checked every 2 days", rc({"next": d(12)}) == 2)
+    check("returning show weekly", rc({"st": "Returning Series", "last": d(-90)}) == 7)
+    check("ended show monthly", rc({"st": "Ended", "last": d(-400)}) == 30)
+    check("not found monthly", rc({"err": "not_found"}) == 30)
+    check("failed lookup retried next day", rc({"err": "error"}) == 1)
+
+    fb = lambda sig: patch.fallback_hot(sig, _TODAY, _NOW, 14)
+    check("stored air date 5 days ago: hot", fb({"last_air": _TODAY - _td(days=5)}))
+    check("stored air date 30 days ago: not hot", not fb({"last_air": _TODAY - _td(days=30)}))
+    check("future stored air date: hot", fb({"last_air": _TODAY + _td(days=3)}))
+    check("episode first seen 3 days ago: hot",
+          fb({"last_air": _TODAY - _td(days=300), "last_new": _NOW - 3 * _DAY}))
+    check("nothing stored: not hot", not fb({}))
+
+    check("provider date parsed", patch._provider_lm("1790000000", _NOW) == 1790000000.0)
+    check("provider date of zero ignored", patch._provider_lm("0", _NOW) is None)
+    check("provider date in milliseconds ignored",
+          patch._provider_lm(str(int(_NOW * 1000)), _NOW) is None)
+    check("non-numeric provider date ignored", patch._provider_lm("n/a", _NOW) is None)
+    check("tmdb id normalized", patch._norm_tmdb_id(" 1399 ") == "1399")
+    check("'tv/' prefix accepted", patch._norm_tmdb_id("tv/1399") == "1399")
+    check("junk tmdb id rejected",
+          patch._norm_tmdb_id("abc") is None and patch._norm_tmdb_id("0") is None)
+
+
+def test_classify_hot_prefers_tmdb():
+    print("test_classify_hot_prefers_tmdb")
+    cfg = _cfg()
+    recent = _TODAY - _td(days=5)
+    signals = {
+        1: {"name": "EN - Alpha Show", "year": 2020, "tmdb_id": "11", "last_air": recent},
+        2: {"name": "EN - Beta Show", "year": 2020, "tmdb_id": "22", "last_air": recent},
+        3: {"name": "EN - Gamma Show", "year": 2020, "tmdb_id": "33", "last_air": recent},
+        4: {"name": "EN - Delta Show", "year": 2020, "tmdb_id": None,
+            "last_air": _TODAY - _td(days=200)},
+    }
+    items = {
+        "11": {"name": "Alpha Show", "year": 2020, "last": (_TODAY - _td(days=2)).isoformat()},
+        "22": {"name": "Beta Show", "year": 2020, "last": (_TODAY - _td(days=40)).isoformat(),
+               "next": (_TODAY + _td(days=30)).isoformat()},
+        "33": {"name": "Completely Different", "year": 1995},
+    }
+    hot, counts = patch.classify_hot([1, 2, 3, 4], signals, items, cfg, _TODAY, _NOW)
+    check("TMDB says airing: hot", 1 in hot)
+    check("TMDB says on a break: NOT hot, even with a recent stored date", 2 not in hot)
+    check("TMDB entry for the wrong show: falls back to stored dates (hot)", 3 in hot)
+    check("no TMDB id, old stored date: not hot", 4 not in hot)
+    check("counts: 1 by tmdb, 1 by fallback, 2 known, 1 mismatch",
+          counts == {"tmdb": 1, "fallback": 1, "known": 2, "mismatch": 1})
+    hot_nokey, _ = patch.classify_hot([1, 2, 3, 4], signals, {}, cfg, _TODAY, _NOW)
+    check("no TMDB data at all: stored dates decide", hot_nokey == {1, 2, 3})
+
+
+def test_update_misses_and_priority():
+    print("test_update_misses_and_priority")
+    k = patch._pair_key
+    prev = {k(7, 1): "h", k(7, 2): "c", k(9, 4): "n"}
+    prev_epoch = _NOW - _DAY
+    rows = [
+        _rel(7, 1, ler=prev_epoch + 600),   # refreshed by that run
+        _rel(7, 2, ler=prev_epoch - 600),   # still not refreshed
+        _rel(7, 3, ler=prev_epoch - 600),   # wasn't due then
+        _rel(9, 4, ler=None),               # still never refreshed
+    ]
+    m = patch.update_misses(prev, prev_epoch, rows, {k(7, 2): 1})
+    check("refreshed pair drops out", k(7, 1) not in m)
+    check("still-unrefreshed pair counts one more missed run", m.get(k(7, 2)) == 2)
+    check("pair that wasn't due is not carried", k(7, 3) not in m)
+    check("never-refreshed due pair is carried", m.get(k(9, 4)) == 1)
+    check("no previous run recorded: nothing carried",
+          patch.update_misses(prev, None, rows, {}) == {})
+
+    due = {(7, 1): "c", (7, 2): "n", (9, 3): "h", (9, 4): "c", (7, 5): "r"}
+    by_account, rank = patch.due_by_account(due, {k(7, 5): 2})
+    check("per-account order: new, carried, then cold", by_account[7] == [2, 5, 1])
+    check("hot before cold on the other account", by_account[9] == [3, 4])
+
+    reset(settings={"sweep_batch_size": 1, "sweep_spacing_seconds": 0})
+    patch._dispatch_refresh(by_account, 1, 0, rank=rank)
+    check("chunks interleave across accounts by priority",
+          ENV.enqueued == [(7, [2]), (7, [5]), (9, [3]), (7, [1]), (9, [4])])
+
+
+def test_stale_means_due_and_unrefreshed():
+    print("test_stale_means_due_and_unrefreshed")
+    reset()
+    old = _dt(2026, 10, 20, tzinfo=_utc_tz.utc)
+    rows = [
+        {"m3u_account_id": 7, "m3u_account__name": "Provider1", "series_id": 1,
+         "last_episode_refresh": old},
+        {"m3u_account_id": 7, "m3u_account__name": "Provider1", "series_id": 2,
+         "last_episode_refresh": old},
+        {"m3u_account_id": 9, "m3u_account__name": "Provider2", "series_id": 3,
+         "last_episode_refresh": None},
+    ]
+    check("no due set yet: every row counts (1.1.x definition)",
+          len(patch._restrict_to_due([dict(r) for r in rows])) == 3)
+    ENV.coresettings[patch.WATCHLIST_CORE_KEY] = {
+        "series": {"1": 0, "2": 0, "3": 0},
+        "due": {"at_epoch": _NOW, "pairs": {"7:1": "h"}},
+        "misses": {"7:1": 1},
+    }
+    patch._invalidate_watchlist_cache()
+    kept = patch._restrict_to_due([dict(r) for r in rows])
+    check("not-due cold relation is not stale", [r["series_id"] for r in kept] == [1, 3])
+    b = patch._stale_age_buckets(kept, now=_dt(2026, 11, 2, tzinfo=_utc_tz.utc))
+    check("age counts runs missed, not days elapsed (missed 1 earlier run -> '2')",
+          b == {"never": 1, "1": 0, "2": 1, "3+": 0})
+    ENV.coresettings[patch.WATCHLIST_CORE_KEY]["due"] = {"at_epoch": _NOW, "pairs": {}}
+    patch._invalidate_watchlist_cache()
+    check("an EMPTY due set means nothing is due (not 'no due set')",
+          [r["series_id"] for r in patch._restrict_to_due([dict(r) for r in rows])] == [3])
+
+
+def test_sweep_tiered_end_to_end():
+    print("test_sweep_tiered_end_to_end")
+    reset(settings={"sweep_batch_size": 0})
+    ENV.accounts = [{"id": 7, "server_url": "http://p7.example"},
+                    {"id": 9, "server_url": "http://p9.example"}]
+    ENV.auth_fail = {"http://p9.example": True}       # account 9 unreachable
+    (on1,), (hotb, cold, pend, only9) = _slot_ids(1, 4)
+    CLOCK.t = _NOW
+    y = _NOW - _DAY
+    ENV.relations = [
+        dict(_rel(7, hotb, ler=y), id=1, active=True, xc=True),
+        dict(_rel(7, cold, ler=y), id=2, active=True, xc=True),
+        dict(_rel(7, on1, ler=_NOW - 3 * _DAY), id=3, active=True, xc=True),
+        dict(_rel(7, pend, ler=y), id=4, active=True, xc=True),
+        dict(_rel(9, only9, ler=y), id=5, active=True, xc=True),
+    ]
+    ENV.coresettings[patch.WATCHLIST_CORE_KEY] = {
+        "series": {str(s): _NOW - 3600 for s in (hotb, cold, on1, pend, only9)},
+        "pending_new": [str(pend), str(only9)],
+    }
+    saved = (patch._series_signals, patch._now_local, patch._visible_bumps)
+    patch._series_signals = lambda pks: {hotb: {"last_air": _TODAY - _td(days=2)}}
+    patch._now_local = lambda: _dt(2026, 11, 2, 8, 0, 0)
+    patch._visible_bumps = lambda pks: {}
+    try:
+        summary = patch.run_sweep_impl()
+    finally:
+        patch._series_signals, patch._now_local, patch._visible_bumps = saved
+    sent = {(a, s) for a, sids in ENV.enqueued for s in sids}
+    check("hot, slot-due and new series dispatched; off-slot cold is not",
+          sent == {(7, hotb), (7, on1), (7, pend)})
+    check("new series dispatched first", ENV.enqueued[0] == (7, [pend, hotb, on1]))
+    check("summary counts the due set by tier",
+          summary["due"] == {"h": 1, "c": 1, "n": 2} and summary["due_pairs"] == 4)
+    check("unreachable provider recorded by name",
+          summary.get("skipped_names") == ["Provider9"])
+    wl = patch.get_watchlist(force=True)
+    check("due set persisted with the sweep's start time",
+          wl["due"]["at_epoch"] == summary["at_epoch"]
+          and patch._pair_key(9, only9) in wl["due"]["pairs"])
+    check("dispatched new series leaves the queue", str(pend) not in wl["pending_new"])
+    check("new series whose provider was unreachable stays queued",
+          str(only9) in wl["pending_new"])
+    check("no TMDB lookups queued without a key",
+          not [t for t in ENV.plugin_tasks if t["name"] == patch.TMDB_TASK_PATH])
+
+    # Next day, nothing was refreshed: yesterday's due pairs are carried.
+    ENV.enqueued.clear()
+    ENV.auth_fail = {}
+    CLOCK.t = _NOW + _DAY
+    patch._series_signals = lambda pks: {}
+    patch._now_local = lambda: _dt(2026, 11, 3, 8, 0, 0)
+    patch._visible_bumps = lambda pks: {}
+    try:
+        summary2 = patch.run_sweep_impl()
+    finally:
+        patch._series_signals, patch._now_local, patch._visible_bumps = saved
+    wl2 = patch.get_watchlist(force=True)
+    check("missed pairs are carried into the next run",
+          wl2["misses"].get(patch._pair_key(7, hotb)) == 1
+          and summary2["due"].get("r", 0) >= 3)
+
+
+def test_sweep_survives_unreadable_provider_dates():
+    print("test_sweep_survives_unreadable_provider_dates")
+    reset()
+    seed_relations()
+    patch._observe(11)
+    patch._observe(21)
+    saved_values = RelQS.values
+
+    def picky(self, *fields):
+        if patch.PROVIDER_LM_FIELD in fields:
+            raise RuntimeError("unsupported lookup")
+        return saved_values(self, *fields)
+    RelQS.values = picky
+    try:
+        summary = patch.run_sweep_impl()
+    finally:
+        RelQS.values = saved_values
+    check("sweep still dispatches without the provider dates",
+          sorted(a for a, _ in ENV.enqueued) == [7, 9] and summary["tasks"] == 2)
+
+
+def test_sweep_queues_tmdb_when_keyed():
+    print("test_sweep_queues_tmdb_when_keyed")
+    reset(settings={"tmdb_api_key": "k"})
+    seed_relations()
+    patch._observe(11)
+    saved = patch._series_signals
+    patch._series_signals = lambda pks: {}
+    try:
+        patch.run_sweep_impl()
+    finally:
+        patch._series_signals = saved
+    t = [t for t in ENV.plugin_tasks if t["name"] == patch.TMDB_TASK_PATH]
+    check("one TMDB run queued after the sweep", len(t) == 1)
+    check("...on the plugin-capable queue, after a delay",
+          bool(t) and t[0]["queue"] == "dvr"
+          and t[0]["countdown"] == patch.TMDB_FIRST_DELAY_SECONDS)
+
+
+def test_tmdb_refresh_runs():
+    print("test_tmdb_refresh_runs")
+    reset(settings={"tmdb_api_key": "k"})
+    CLOCK.t = _NOW
+    ENV.coresettings[patch.WATCHLIST_CORE_KEY] = {"series": {"1": _NOW, "2": _NOW, "3": _NOW}}
+    calls = []
+
+    def fake_fetch(tid, key):
+        calls.append(tid)
+        return {"name": "S" + tid, "year": 2020, "st": "Returning Series",
+                "last": "2026-01-01", "next": None}
+    saved = (patch._series_signals, patch._tmdb_fetch, patch.TMDB_SPACING_SECONDS,
+             patch._now_local, patch.TMDB_BATCH)
+    patch._series_signals = lambda pks: {1: {"tmdb_id": "11"}, 2: {"tmdb_id": "22"},
+                                         3: {"tmdb_id": None}}
+    patch._tmdb_fetch = fake_fetch
+    patch.TMDB_SPACING_SECONDS = 0
+    patch._now_local = lambda: _dt(2026, 11, 2, 8, 0, 0)
+    try:
+        s1 = patch.tmdb_refresh_impl()
+        items = patch._read_tmdb_cache()["items"]
+        check("each watched TMDB id looked up once", sorted(calls) == ["11", "22"])
+        check("entries cached with a fetch time", all("f" in items[t] for t in ("11", "22")))
+        check("summary counts the lookups", s1["looked_up"] == 2 and s1["remaining"] == 0)
+
+        calls.clear()
+        s2 = patch.tmdb_refresh_impl()
+        check("fresh entries are not looked up again", calls == [] and s2["looked_up"] == 0)
+
+        # More due than one batch: re-queues itself.
+        ENV.coresettings.pop(patch.TMDB_CORE_KEY, None)
+        patch.TMDB_BATCH = 1
+        s3 = patch.tmdb_refresh_impl()
+        requeued = [t for t in ENV.plugin_tasks if t["name"] == patch.TMDB_TASK_PATH]
+        check("a full batch with more due re-queues itself",
+              s3["remaining"] == 1 and len(requeued) == 1)
+        patch.TMDB_BATCH = saved[4]
+
+        # Daily budget spent: nothing looked up.
+        ENV.coresettings[patch.TMDB_CORE_KEY] = {"items": {}, "meta": {
+            "day": "2026-11-02", "count": patch.TMDB_DAILY_CAP}}
+        calls.clear()
+        s4 = patch.tmdb_refresh_impl()
+        check("daily lookup budget is respected", calls == [] and s4["looked_up"] == 0)
+
+        # A rejected key stops the run and shows in status.
+        ENV.coresettings.pop(patch.TMDB_CORE_KEY, None)
+
+        def bad_key(tid, key):
+            calls.append(tid)
+            raise patch.TmdbAuthError("HTTP 401")
+        patch._tmdb_fetch = bad_key
+        calls.clear()
+        s5 = patch.tmdb_refresh_impl()
+        cfg = patch._load_config(force=True)
+        check("rejected key stops the run after the first refusal",
+              s5["stopped"] == "TMDB rejected the key" and len(calls) == 1)
+        check("...and caches nothing for the refused lookup",
+              patch._read_tmdb_cache()["items"] == {})
+        check("status reports the bad key",
+              patch.tmdb_status(cfg, patch.get_watchlist(force=True)) == "BAD KEY")
+
+        def limited(tid, key):
+            raise patch.TmdbRateLimited("HTTP 429")
+        patch._tmdb_fetch = limited
+        ENV.plugin_tasks.clear()
+        s6 = patch.tmdb_refresh_impl()
+        check("rate limit stops the run without re-queuing",
+              s6["stopped"] == "rate limited"
+              and not [t for t in ENV.plugin_tasks if t["name"] == patch.TMDB_TASK_PATH])
+        check("a later run that isn't rejected clears the bad-key flag",
+              patch._read_tmdb_cache()["meta"].get("auth_error") is None)
+    finally:
+        (patch._series_signals, patch._tmdb_fetch, patch.TMDB_SPACING_SECONDS,
+         patch._now_local, patch.TMDB_BATCH) = saved
+
+    reset()
+    check("no key: lookups skipped", patch.tmdb_refresh_impl()["skipped"] == "no TMDB key")
+    check("no key: status says off",
+          patch.tmdb_status(patch._load_config(force=True), {}) == "off")
+
+    leak = RuntimeError("HTTPSConnectionPool(host='api.example.org', port=443): Max "
+                        "retries exceeded with url: /3/tv/1?api_key=SECRETKEY123 (timeout)")
+    out = patch._tmdb_err(leak)
+    check("TMDB error text never carries the key",
+          "SECRETKEY123" not in out and "api_key" not in out)
+    leak2 = ValueError("Invalid response from /3/tv/1?api_key=SECRETKEY123&language=en")
+    check("...even when the URL isn't introduced by 'url'",
+          "SECRETKEY123" not in patch._tmdb_err(leak2))
+
+    due = patch.tmdb_lookups_due(
+        ["1", "2", "3"],
+        {"2": {"f": _NOW - 10 * _DAY, "st": "Returning Series"},
+         "3": {"f": _NOW - 30 * _DAY, "st": "Returning Series"}},
+        _TODAY, _NOW, 10)
+    check("never-looked-up first, then the longest-unchecked", due == ["1", "3", "2"])
+
+
+def test_tiering_config():
+    print("test_tiering_config")
+    cfg = _cfg()
+    check("defaults", cfg["tiered"] is True and cfg["provider_promotion"] is True
+          and cfg["hot_aired_days"] == 10 and cfg["fallback_hot_days"] == 14
+          and cfg["rotation_days"] == 7 and cfg["tmdb_key"] == "")
+    check("out-of-range rotation falls back to the default",
+          _cfg(cold_rotation_days=0)["rotation_days"] == 7
+          and _cfg(cold_rotation_days=40)["rotation_days"] == 7)
+    check("string booleans parsed", _cfg(tiered_refresh="false")["tiered"] is False)
+    os.environ["TMDB_API_KEY"] = "envkey"
+    try:
+        check("TMDB key falls back to the environment", _cfg()["tmdb_key"] == "envkey")
+        check("the plugin setting wins over the environment",
+              _cfg(tmdb_api_key=" mine ")["tmdb_key"] == "mine")
+    finally:
+        del os.environ["TMDB_API_KEY"]
+
+
+def test_watchlist_expiry_by_ignored_chances():
+    print("test_watchlist_expiry_by_ignored_chances")
+    G = patch.CHANCE_GRACE_SECONDS
+    seen = 1_000_000.0
+    c1 = patch.update_chances({"1": seen}, {}, {1: seen + 5 * _DAY}, seen + 5 * _DAY + G)
+    check("a bump the client had time to see counts", c1 == {"1": [1, seen + 5 * _DAY]})
+    c2 = patch.update_chances({"1": seen}, c1, {1: seen + 5 * _DAY}, seen + 9 * _DAY)
+    check("the same bump counts once", c2 == c1)
+    c3 = patch.update_chances({"1": seen}, c2, {1: seen + 12 * _DAY}, seen + 15 * _DAY)
+    check("a new bump counts again", c3["1"][0] == 2)
+    check("a bump the client already synced past does not count",
+          patch.update_chances({"1": seen}, {}, {1: seen - 60}, seen + 9 * _DAY) == {})
+    check("a bump still inside the grace period does not count",
+          patch.update_chances({"1": seen}, {}, {1: seen + 5 * _DAY},
+                               seen + 5 * _DAY + G - 1) == {})
+    check("no visible bump at all (failed refreshes) never counts",
+          patch.update_chances({"1": seen}, {}, {}, seen + 90 * _DAY) == {})
+
+    ttl = 30 * _DAY
+    exp = patch.is_expired
+    check("past TTL with 3 ignored chances: expired", exp(seen, [3, 0], seen + 31 * _DAY, ttl))
+    check("past TTL with 2 ignored chances: kept", not exp(seen, [2, 0], seen + 60 * _DAY, ttl))
+    check("3 ignored chances but inside TTL: kept", not exp(seen, [5, 0], seen + 20 * _DAY, ttl))
+    check("past the ceiling: expired regardless",
+          exp(seen, None, seen + (patch.EXPIRY_CEILING_DAYS + 1) * _DAY, ttl))
+    check("a TTL longer than the ceiling raises the ceiling",
+          not exp(seen, None, seen + 150 * _DAY, 200 * _DAY))
+
+    # Through the sweep: weekly bumps the client ignores -> dropped once past
+    # the TTL; a show the client re-synced is kept.
+    reset(settings={"watchlist_ttl_days": 30})
+    seed_relations()
+    CLOCK.t = 1_000_000.0
+    patch.record_series(100)
+    patch.record_series(200)
+    t0 = CLOCK.t
+    saved = patch._visible_bumps
+    try:
+        for week in (1, 2, 3, 4, 5):
+            CLOCK.t = t0 + week * 7 * _DAY
+            bump = CLOCK.t - 3 * _DAY
+            patch._visible_bumps = lambda pks, b=bump: {100: b, 200: b}
+            if week == 2:
+                patch.record_series(200)       # client still syncs show 200
+            patch.run_sweep_impl()
+            wl = patch.get_watchlist(force=True)
+            if week == 3:
+                check("week 3: inside the TTL nothing is dropped",
+                      "100" in wl["series"] and wl["chances"].get("100", [0])[0] == 3)
+            if week == 5:
+                check("week 5: show ignoring every bump, past the TTL, is dropped",
+                      "100" not in wl["series"])
+                check("week 5: show the client re-synced is kept", "200" in wl["series"])
+    finally:
+        patch._visible_bumps = saved
+
+
+def test_new_to_watchlist_is_queued():
+    print("test_new_to_watchlist_is_queued")
+    reset()
+    patch.record_series(100)
+    wl = patch.get_watchlist(force=True)
+    check("first observation queues the series as new", wl["pending_new"] == ["100"])
+    CLOCK.advance(patch.OBSERVE_DEDUPE_SECONDS + 1)
+    ENV.coresettings[patch.WATCHLIST_CORE_KEY]["pending_new"] = []
+    ENV.coresettings[patch.WATCHLIST_CORE_KEY]["chances"] = {"100": [2, 5.0]}
+    patch._invalidate_watchlist_cache()
+    patch.record_series(100)
+    wl = patch.get_watchlist(force=True)
+    check("a series already watched is not queued again", wl["pending_new"] == [])
+    check("an observation clears its ignored-bump count", "100" not in wl["chances"])
+    removed = patch.clear_watchlist()
+    wl = patch.get_watchlist(force=True)
+    check("clear empties every 1.2.0 field too",
+          removed == 1 and wl["pending_new"] == [] and wl["chances"] == {}
+          and wl["due"] is None and wl["misses"] == {})
+
+
+def test_watchlist_row_old_shape_reads():
+    print("test_watchlist_row_old_shape_reads")
+    reset()
+    ENV.coresettings[patch.WATCHLIST_CORE_KEY] = {"series": {"5": 1.0}, "last_sweep": None}
+    patch._invalidate_watchlist_cache()
+    wl = patch.get_watchlist(force=True)
+    check("a 1.1.x row reads with empty 1.2.0 fields",
+          wl["series"] == {"5": 1.0} and wl["chances"] == {} and wl["pending_new"] == []
+          and wl["due"] is None and wl["misses"] == {})
+    ENV.coresettings[patch.WATCHLIST_CORE_KEY].update(
+        {"chances": {"5": [1, 2.0]}, "pending_new": ["5"],
+         "due": {"at_epoch": 3.0, "pairs": {"7:5": "c"}}, "misses": {"7:5": 1}})
+    patch._invalidate_watchlist_cache()
+    wl = patch.get_watchlist(force=True)
+    check("1.2.0 fields survive the row parser",
+          wl["chances"] == {"5": [1, 2.0]} and wl["pending_new"] == ["5"]
+          and wl["due"]["pairs"] == {"7:5": "c"} and wl["misses"] == {"7:5": 1})
+
+
+def test_visible_bump_matches_core_order():
+    print("test_visible_bump_matches_core_order")
+    reset()
+    ENV.relations = [
+        {"id": 5, "series_id": 1, "m3u_account_id": 7, "m3u_account__priority": 1,
+         "updated_at": 100.0},
+        {"id": 6, "series_id": 1, "m3u_account_id": 8, "m3u_account__priority": 3,
+         "updated_at": 50.0},
+        {"id": 4, "series_id": 1, "m3u_account_id": 9, "m3u_account__priority": 3,
+         "updated_at": 70.0},
+        {"id": 9, "series_id": 1, "m3u_account_id": 6, "m3u_account__priority": 9,
+         "updated_at": 999.0, "active": False},
+    ]
+    check("highest active priority, then lowest id, as core's get_series picks",
+          patch._visible_bumps([1]) == {1: 70.0})
+
+
+def test_status_shows_tiers_and_names():
+    print("test_status_shows_tiers_and_names")
+    cfg = _cfg()
+    wl = {"series": {"1": 0}, "last_sweep": {
+              "at": "2026-11-02 08:00:00", "accounts": 2, "tasks": 9,
+              "due": {"n": 1, "h": 30, "c": 400}, "stale_total": 0,
+              "skipped_accounts": [9], "skipped_names": ["Provider9"]},
+          "last_retry": None}
+    live = {"total": 0, "by_account": {}, "by_age": {}, "error": None}
+    msg = patch.build_status_message(cfg, wl, live, 1, True, id_mode="series", tmdb="30/31")
+    check("due counts by tier shown", "due n1 r0 h30 p0 c400" in msg)
+    check("TMDB coverage shown", "tmdb 30/31" in msg)
+    check("unreachable provider shown by name", "UNREACHABLE Provider9" in msg)
+    check("default queue and TTL stay quiet", "q=" not in msg and "ttl=" not in msg)
+    off = patch.build_status_message(_cfg(tiered_refresh=False), wl, live, 1, True)
+    check("tiers off is spelled out", "TIERS OFF" in off)
+    odd = patch.build_status_message(_cfg(watchlist_ttl_days=45, schedule_queue="alt"),
+                                     wl, live, 1, True)
+    check("non-default queue and TTL are shown", "q=alt" in odd and "ttl=45d" in odd)
+
+
 if __name__ == "__main__":
     test_observation_records_and_dedupes()
     test_wrapper_passthrough()
@@ -1852,6 +2467,22 @@ if __name__ == "__main__":
     test_preflight_fails_open_on_code_errors()
     test_import_time_schedule_follows_should_skip()
     test_status_shows_the_id_mode()
+    test_compute_due_tiers()
+    test_promotion_noise_guard()
+    test_tmdb_schedule_rules()
+    test_classify_hot_prefers_tmdb()
+    test_update_misses_and_priority()
+    test_stale_means_due_and_unrefreshed()
+    test_sweep_tiered_end_to_end()
+    test_sweep_survives_unreadable_provider_dates()
+    test_sweep_queues_tmdb_when_keyed()
+    test_tmdb_refresh_runs()
+    test_tiering_config()
+    test_watchlist_expiry_by_ignored_chances()
+    test_new_to_watchlist_is_queued()
+    test_watchlist_row_old_shape_reads()
+    test_visible_bump_matches_core_order()
+    test_status_shows_tiers_and_names()
     try:
         os.remove(_scratch)
     except OSError:

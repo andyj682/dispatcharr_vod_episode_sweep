@@ -283,6 +283,119 @@ hours. Status therefore reports a live audit alongside the historical record,
 labelled as such — a stored number with no indication of its age is an
 invitation to misdiagnose.
 
+## Tiered refresh (v1.2.0)
+
+Refreshing every relation of every watched series daily is simple, but most
+watched shows are not airing, so nearly all of that work goes to shows that
+cannot have changed. Meanwhile a flaky provider leaves relations stale that the
+retries cannot finish. 1.2.0 refreshes what is **due**, per (account, series)
+pair, in priority order:
+
+| Tier | Rule | Cadence |
+|---|---|---|
+| `n` new | a relation never refreshed, or a series new to the watchlist | next run |
+| `r` carried | due on an earlier run and still not refreshed | until done |
+| `h` hot | airing (below) | daily |
+| `p` promoted | the provider's own `last_modified` is newer than our last refresh of that relation | that day, that account |
+| `c` cold | everything else: `series_pk % R == day % R`, or the oldest refresh is older than `R + 2` days | every `R` days (default 7) |
+
+**Three signals, in order of authority.**
+
+1. **TMDB's schedule** (primary, optional key). Hot when an episode aired
+   within `A` days (default 10, covering providers that post late) or the next
+   one airs within 3. TMDB knows the schedule rather than recent history, so a
+   show on a break is not hot and becomes hot just before it returns, however
+   long the break. A cached "next episode" that has since passed still counts,
+   so the cache lagging the premiere can't drop a show.
+2. **The provider's listing date** (promotion). Dispatcharr's catalog refresh
+   stores each provider's raw `get_series` entry on the relation
+   (`custom_properties['basic_data']`, present on 0.32.0 and 0.33.0), including
+   the provider's XC `last_modified`. It is read as a JSON key transform, so the
+   rest of the blob never leaves the database. This is an **independent
+   override that TMDB never vetoes**: TMDB knows when a show airs in the world,
+   the provider date knows when *this provider* has it — a later release in
+   another region, a late posting, a new copy of an old show, backfilled
+   seasons. The two fail differently, which is why the provider date may
+   override: a provider stamping its whole catalog costs one extra refresh of
+   that provider for a day (exactly the pre-1.2.0 daily cost), and is caught by
+   a noise guard (more than 25% of a provider's watched relations, and at
+   least 20, changed at once: ignored for the run); a wrong TMDB answer costs
+   missed episodes and nothing else would notice. Junk dates (before 2000,
+   millisecond values, far future) are ignored.
+3. **Stored dates** (fallback, for shows without usable TMDB data): hot while
+   `Episode.air_date` is within `H` days (default 14) or in the future, or an
+   episode was first seen (`Episode.created_at`) within `H` days. "First seen"
+   is only trustworthy over short windows, because most stored episodes were
+   first fetched when this plugin began refreshing everything.
+
+**TMDB sanity check.** Provider-supplied TMDB ids are sometimes wrong. An entry
+is rejected when its first-air year differs from `Series.year` by more than one,
+or the titles share no significant word (provider decoration such as a language
+prefix, year, region tag or "4K" is stripped first). A rejected entry sends the
+series to the stored-date fallback, never to "not airing".
+
+**Stale, redefined.** With tiers, most relations are deliberately left alone on
+most days, so "not refreshed since the sweep began" would flag every cold show.
+The sweep records its due set (with its start time) and the carried-over counts
+alongside `last_sweep`; stale means *in that due set and not refreshed since*,
+plus anything never refreshed. The age buckets count runs missed, not days. With
+no due set recorded (before the first 1.2.0 sweep) the 1.1.x definition applies,
+so an upgrade changes nothing until the first run.
+
+**Priority** applies to the sweep and to retries, and chunks are interleaved
+across accounts by the rank of their first series, so one account's rotation
+work never queues ahead of another's new or airing shows. Under purely random
+provider failure order changes no single request's odds; it pays off when a
+pass is cut short.
+
+**Unreachable providers** keep their pairs in the due set, so they read as stale
+and are carried into the next run; a new series whose only provider was
+unreachable stays queued as new.
+
+**TMDB lookups** run as a plugin task on the plugin-capable queue, queued
+after the sweep's dispatch so a slow TMDB never delays a refresh. Each run looks
+up at most 200 ids (throttled), re-queues itself while more are due, stops at
+1,500 a day, and stops at once on a rejected key (shown in status as `BAD KEY`)
+or a rate limit. Entries are re-checked every 2 days for hot or soon-premiering
+shows, weekly for returning ones, monthly for ended or not-found ones, and the
+next day after a failed lookup. The sweep tiers on the cache from earlier runs.
+Error text is scrubbed of the API key before logging, since `requests` puts the
+full URL into its errors. TMDB decides **cadence only**: it never adds or
+removes a watched series.
+
+## Watchlist expiry (v1.2.0)
+
+Membership is maintained by observation, and observation depends on bumps: a
+refresh saves the relation, `updated_at` (= XC `last_modified`) moves, the
+client's incremental sync notices and calls `get_series_info`, and the plugin
+re-stamps the series. With a daily refresh of everything, a 30-day TTL was
+never close. With tiering, three facts make a time-only rule unsafe:
+
+- **Only one relation is visible.** `get_series` reports `last_modified` from
+  the active relation with the highest account priority (lowest id first) —
+  `_xc_fetch_priority_distinct_relations`. Refreshes of other copies are
+  invisible to the client.
+- **A failed refresh bumps nothing.** `refresh_series_episodes` only saves the
+  relation when the provider call succeeds, and the catalog refresh's
+  `bulk_update` leaves `updated_at` alone, so this plugin's refresh is the only
+  routine bumper.
+- **The client never re-syncs on a schedule** — it fetches only on change.
+
+So a cold show whose top provider is flaky could go weeks without a visible
+bump and silently age out while still followed.
+
+The rule now asks the question the TTL was standing in for — *has the client
+stopped caring?* — using the evidence for it: **the client was given a reason
+to re-sync and didn't.** A *chance* is the visible `last_modified` moving past
+the series' last observation, with 2 days' grace for the client to react; each
+distinct bump counts once, and failed refreshes never count. Observation clears
+the count. A series expires only when it has ignored 3 chances **and** is past
+the TTL (so nothing expires faster than before), or after 120 days unseen
+regardless (or the TTL, if longer) for a series whose top provider can never
+deliver a bump. The rotation period is capped at 28 days, well under that
+ceiling. The `series` map's format is unchanged; the counts live in a separate
+`chances` map, so 1.1.x still reads the row.
+
 ## Surviving an upstream signature change (v1.0.1)
 
 "Fail-open" is the plugin's core safety property, but it has a precise limit
@@ -354,10 +467,10 @@ that watermark, so the generator re-fetches it, which re-fires observation and
 keeps it on the watchlist. **Invariant to preserve:** never stamp `last_modified`
 with a backdated value (a provider timestamp, an air date) — a global watermark
 cannot see a change beneath its own ceiling, which would silently break
-retention. (This is also why the deferred "conditional `last_modified`"
-efficiency change is *not* free: suppressing the bump on unchanged series would
-stop them being re-observed and let them age out — trading churn for a coverage
-hole.)
+retention. (This is also why suppressing bumps is *not* free: a series that is
+bumped less often is re-observed less often. v1.2.0's tiered refresh does
+exactly that for shows that aren't airing, which is why it ships together with
+the ignored-chances expiry rule above rather than relying on the TTL.)
 
 ## Debug visibility
 

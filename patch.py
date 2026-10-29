@@ -22,7 +22,9 @@ refresh ALL relations of each watched series:
 
 `series_ids` forces every one of that account's relations for the series and
 bypasses the 24h gate, so the whole candidate set is warmed across providers and
-categories. Because that refresh also bumps each relation's `updated_at` (the
+categories. Since 1.2.0 a run refreshes only what is DUE -- new and carried-over
+work, airing shows, provider-changed shows and a rotating slice of the rest
+(see "Tiered refresh" below). Because that refresh also bumps each relation's `updated_at` (the
 value XC surfaces as `last_modified`), the client's normal incremental sync then
 notices the series and re-pulls the newly-materialised episodes.
 
@@ -176,6 +178,53 @@ MAX_WATCHLIST = 20000           # defensive cap on watchlist size
 DAILY_PREFIX = "vodsweep:daily:"
 DAILY_KEY_TTL = 129600          # 36h, so the day-key self-expires
 
+# --- Tiered refresh (1.2.0) -------------------------------------------------
+# Most watched shows are not airing, so refreshing every relation every day
+# spends nearly all of the provider budget on shows that cannot have changed.
+# Each run instead refreshes what is DUE: new and carried-over work, shows that
+# are airing ("hot"), shows a provider says it changed ("promoted"), and a
+# rotating slice of everything else ("cold"). See "Tiered refresh" below.
+DEFAULT_TIERED = True
+DEFAULT_HOT_AIRED_DAYS = 10     # hot for this long after an episode airs
+HOT_UPCOMING_DAYS = 3           # ...and from this long before the next one
+DEFAULT_FALLBACK_HOT_DAYS = 14  # stored-date window when TMDB has nothing usable
+DEFAULT_ROTATION_DAYS = 7       # every cold show is refreshed at least this often
+OVERDUE_SLACK_DAYS = 2          # a cold show this far past its rotation is due anyway
+DEFAULT_PROVIDER_PROMOTION = True
+# A provider stamping most of its listing at once is noise, not news: ignore its
+# change dates for the run rather than promote everything it carries.
+PROMOTION_NOISE_SHARE = 0.25
+PROMOTION_NOISE_MIN = 20
+# The provider's own XC `last_modified`, as Dispatcharr's catalog refresh stored
+# it on the relation. Read as a JSON key transform so the rest of the (large)
+# custom_properties blob never leaves the database.
+PROVIDER_LM_FIELD = "custom_properties__basic_data__last_modified"
+# Dispatch / retry priority: new, carried over from an earlier run, hot,
+# promoted, cold.
+TIER_RANK = {"n": 0, "r": 1, "h": 2, "p": 3, "c": 4}
+
+# --- Watchlist expiry (1.2.0) -----------------------------------------------
+# A show is dropped only when the client was given reasons to re-sync it and
+# ignored them, not merely because time passed: with tiering, an old show is
+# bumped weekly at best, and only when its top provider answers. See
+# "Watchlist expiry" below.
+CHANCE_GRACE_SECONDS = 2 * 86400  # time the client gets to react to a bump
+CHANCES_TO_EXPIRE = 3             # ignored bumps before a show may expire
+EXPIRY_CEILING_DAYS = 120         # unseen this long expires regardless
+MAX_PENDING_NEW = 5000            # cap on the "new to the watchlist" queue
+
+# --- TMDB (1.2.0) -----------------------------------------------------------
+TMDB_CORE_KEY = "dispatcharr_vod_episode_sweep_tmdb"
+TMDB_CORE_NAME = "Dispatcharr VOD Episode Sweep - TMDB cache"
+TMDB_TASK_PATH = "dispatcharr_vod_episode_sweep.run_tmdb_refresh"
+TMDB_API_BASE = "https://api.themoviedb.org/3"
+TMDB_BATCH = 200                # lookups per task run (the task re-queues itself)
+TMDB_DAILY_CAP = 1500           # lookups per day, all runs together
+TMDB_SPACING_SECONDS = 0.3      # between lookups; far under TMDB's rate limit
+TMDB_TIMEOUT_SECONDS = 10
+TMDB_SAVE_EVERY = 25            # persist the cache every N lookups
+TMDB_FIRST_DELAY_SECONDS = 60   # after a sweep's dispatch, so it never delays it
+
 # --------------------------------------------------------------------------- #
 # Module state
 # --------------------------------------------------------------------------- #
@@ -236,6 +285,22 @@ def _as_float(value, default):
         return f if f > 0 else default
     except (TypeError, ValueError):
         return default
+
+
+def _as_bool(value, default):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() not in ("false", "0", "no", "off", "")
+
+
+def _as_int_in(value, default, lo, hi):
+    try:
+        i = int(value)
+    except (TypeError, ValueError):
+        return default
+    return i if lo <= i <= hi else default
 
 
 def _debug_file_path() -> str:
@@ -366,6 +431,12 @@ def _load_config(force: bool = False) -> dict:
     queue = (settings.get("schedule_queue") or DEFAULT_SCHEDULE_QUEUE)
     queue = str(queue).strip() or DEFAULT_SCHEDULE_QUEUE
 
+    # The plugin setting wins; Dispatcharr's own TMDB_API_KEY (read by core for
+    # DVR metadata, container environment only) is the fallback.
+    tmdb_key = str(settings.get("tmdb_api_key") or "").strip()
+    if not tmdb_key:
+        tmdb_key = str(os.environ.get("TMDB_API_KEY") or "").strip()
+
     cfg = {
         "sweep_hour": hour,
         "ttl_seconds": _as_float(settings.get("watchlist_ttl_days"), DEFAULT_TTL_DAYS) * 86400.0,
@@ -375,6 +446,18 @@ def _load_config(force: bool = False) -> dict:
         "schedule_queue": queue,
         "auto_retry": auto_retry,
         "retry_passes": retry_passes,
+        "tiered": _as_bool(settings.get("tiered_refresh"), DEFAULT_TIERED),
+        "provider_promotion": _as_bool(settings.get("provider_promotion"),
+                                       DEFAULT_PROVIDER_PROMOTION),
+        "hot_aired_days": _as_int_in(settings.get("hot_aired_days"),
+                                     DEFAULT_HOT_AIRED_DAYS, 1, 60),
+        "fallback_hot_days": _as_int_in(settings.get("fallback_hot_days"),
+                                        DEFAULT_FALLBACK_HOT_DAYS, 1, 120),
+        # Capped well under the expiry ceiling, so a cold show is always bumped
+        # several times before it could expire.
+        "rotation_days": _as_int_in(settings.get("cold_rotation_days"),
+                                    DEFAULT_ROTATION_DAYS, 1, 28),
+        "tmdb_key": tmdb_key,
     }
     with _cfg_lock:
         _cfg_cache = cfg
@@ -403,10 +486,17 @@ def is_enabled() -> bool:
 # --------------------------------------------------------------------------- #
 # Watchlist storage (dedicated CoreSettings row)
 # --------------------------------------------------------------------------- #
-# Shape: {"series": {"<pk>": <last_seen_epoch>}, "last_sweep": {...}|None}
+# Shape: {"series": {"<pk>": <last_seen_epoch>}, "last_sweep": {...}|None,
+#         "last_retry": {...}|None,
+#         # 1.2.0 -- all optional, so 1.1.x reads the same row unchanged:
+#         "chances": {"<pk>": [ignored_bump_count, last_counted_epoch]},
+#         "pending_new": [<pk>, ...],          # new to the watchlist, not yet swept
+#         "due": {"at_epoch": <sweep start>, "pairs": {"<acct>:<pk>": tier}},
+#         "misses": {"<acct>:<pk>": <runs due and missed>}}
 
 def _empty_watchlist() -> dict:
-    return {"series": {}, "last_sweep": None, "last_retry": None}
+    return {"series": {}, "last_sweep": None, "last_retry": None,
+            "chances": {}, "pending_new": [], "due": None, "misses": {}}
 
 
 def _read_watchlist_raw() -> dict:
@@ -423,10 +513,20 @@ def _read_watchlist_raw() -> dict:
     # NB: this rebuilds the dict key-by-key, so ANY new persisted field must be
     # listed here or it is silently dropped on read while still sitting in the
     # DB -- writes go through _mutate_watchlist, which preserves the whole row.
+    def _dict(name):
+        v = val.get(name)
+        return v if isinstance(v, dict) else {}
+
+    pending = val.get("pending_new")
+    due = val.get("due")
     return {
         "series": series,
         "last_sweep": val.get("last_sweep"),
         "last_retry": val.get("last_retry"),
+        "chances": _dict("chances"),
+        "pending_new": pending if isinstance(pending, list) else [],
+        "due": due if isinstance(due, dict) else None,
+        "misses": _dict("misses"),
     }
 
 
@@ -482,7 +582,14 @@ def get_watchlist(force: bool = False) -> dict:
 
 
 def record_series(series_pk) -> None:
-    """Upsert a Series PK into the watchlist with last_seen=now."""
+    """Upsert a Series PK into the watchlist with last_seen=now.
+
+    Two 1.2.0 side effects. A series NEW to the watchlist is queued so the
+    next sweep refreshes all of its relations: the client's own first sync
+    refreshes only the top-priority copy. And any observation clears the
+    series' ignored-bump count, since the client has just shown it still
+    follows the show.
+    """
     key = str(series_pk)
     now = time.time()
 
@@ -491,10 +598,19 @@ def record_series(series_pk) -> None:
         prev = series.get(key)
         if prev is not None and (now - float(prev)) < OBSERVE_DEDUPE_SECONDS:
             return False
-        if key not in series and len(series) >= MAX_WATCHLIST:
-            oldest = min(series, key=lambda k: series[k])
-            series.pop(oldest, None)
+        if key not in series:
+            if len(series) >= MAX_WATCHLIST:
+                oldest = min(series, key=lambda k: series[k])
+                series.pop(oldest, None)
+            pending = data.get("pending_new")
+            if not isinstance(pending, list):
+                pending = data["pending_new"] = []
+            if key not in pending and len(pending) < MAX_PENDING_NEW:
+                pending.append(key)
         series[key] = now
+        chances = data.get("chances")
+        if isinstance(chances, dict):
+            chances.pop(key, None)
         return True
 
     _mutate_watchlist(_mut)
@@ -509,6 +625,10 @@ def clear_watchlist() -> int:
         if removed["n"] == 0 and data.get("last_sweep") is None:
             return False
         data["series"] = {}
+        data["chances"] = {}
+        data["pending_new"] = []
+        data["due"] = None
+        data["misses"] = {}
         return True
 
     _mutate_watchlist(_mut)
@@ -735,23 +855,6 @@ def run_sweep():
 # The sweep itself
 # --------------------------------------------------------------------------- #
 
-def _accounts_by_series(series_pks):
-    """{account_id: [series_pk, ...]} for active XC accounts carrying each pk."""
-    from apps.m3u.models import M3UAccount
-    from apps.vod.models import M3USeriesRelation
-
-    rels = M3USeriesRelation.objects.filter(
-        series_id__in=series_pks,
-        m3u_account__is_active=True,
-        m3u_account__account_type=M3UAccount.Types.XC,
-    ).values("m3u_account_id", "series_id")
-
-    by_account = {}
-    for r in rels:
-        by_account.setdefault(r["m3u_account_id"], set()).add(r["series_id"])
-    return {aid: sorted(pks) for aid, pks in by_account.items()}
-
-
 def _safe_err(exc) -> str:
     """Exception text with any URL stripped.
 
@@ -764,6 +867,492 @@ def _safe_err(exc) -> str:
     except Exception:
         msg = ""
     return f"{type(exc).__name__}: {msg[:80]}" if msg else type(exc).__name__
+
+
+# --------------------------------------------------------------------------- #
+# Tiered refresh (1.2.0)
+# --------------------------------------------------------------------------- #
+# Each run refreshes what is DUE rather than everything. Per (account, series)
+# pair, in priority order:
+#
+#   n  new       a relation never refreshed, or a series new to the watchlist
+#   r  carried   due on an earlier run and still not refreshed
+#   h  hot       airing: TMDB's schedule, or stored dates where TMDB has nothing
+#   p  promoted  the provider's own last_modified is newer than our last refresh
+#   c  cold      everything else, on a rotation (plus anything overdue)
+#
+# Three signals decide "hot" and "promoted", in order of authority:
+#
+#   * TMDB's schedule (primary). It knows when the next episode airs, so a show
+#     on a break is not hot, and becomes hot just before it returns.
+#   * The provider's listing date (an independent override, never vetoed by
+#     TMDB). It is the only signal for changes that have nothing to do with
+#     airing: a new copy of an old show, backfilled seasons, fixed episodes.
+#     Its failure mode is extra work for a day; TMDB's is missed episodes.
+#   * Stored air dates and first-seen times (fallback) for shows TMDB has no
+#     usable data for.
+#
+# Everything here is a pure function over plain rows; the thin DB adapters
+# that feed it are below.
+
+def _pair_key(account_id, series_pk) -> str:
+    return f"{account_id}:{series_pk}"
+
+
+def _epoch_of(value):
+    """Unix epoch for a datetime / number, or None."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value.timestamp())
+    except Exception:
+        return None
+
+
+def _to_date(value):
+    """A date from a date / datetime / 'YYYY-MM-DD...' string, or None."""
+    from datetime import date, datetime
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _provider_lm(value, now=None):
+    """The provider's XC `last_modified` as an epoch, or None if unusable.
+
+    Providers send it as a string of seconds. Anything before 2000 or more than
+    two days in the future is junk (zero, a millisecond value, a typo) and is
+    ignored rather than trusted.
+    """
+    try:
+        lm = float(value)
+    except (TypeError, ValueError):
+        return None
+    now = time.time() if now is None else now
+    if lm < 946684800 or lm > now + 2 * 86400:
+        return None
+    return lm
+
+
+_NAME_STOPWORDS = {
+    "the", "and", "for", "with", "from", "eng", "multi", "sub", "subs", "dub",
+    "fhd", "uhd", "hdr", "series", "show", "tv",
+}
+
+
+def _name_words(name) -> set:
+    """Significant lowercase words of a title, for a loose same-show check.
+
+    Provider titles carry decoration TMDB titles don't: a language prefix
+    ("EN - "), a year, a region tag, "4K", "MULTI SUB". Words under three
+    letters and four-digit years are dropped along with that vocabulary.
+    """
+    import re
+    s = str(name or "").lower()
+    s = re.sub(r"^\s*[a-z]{2,3}\s*[-|:]\s+", "", s)   # "EN - ", "NF | "
+    words = set()
+    for w in re.findall(r"[a-z0-9]+", s):
+        if len(w) < 3 or w in _NAME_STOPWORDS or re.fullmatch(r"(19|20)\d\d", w):
+            continue
+        words.add(w)
+    return words
+
+
+def tmdb_sane(series_name, series_year, entry) -> bool:
+    """Does this TMDB entry plausibly describe this series?
+
+    Provider-supplied TMDB ids are sometimes wrong. An entry is rejected when
+    the first-air year differs from the series' year by more than one, or when
+    the titles share no significant word. A title with no usable words (say, a
+    number) passes on the year alone. A rejected entry sends the series to the
+    stored-date fallback -- never to "not airing".
+    """
+    if not entry or entry.get("err"):
+        return False
+    try:
+        if series_year and entry.get("year") and abs(int(series_year) - int(entry["year"])) > 1:
+            return False
+    except (TypeError, ValueError):
+        pass
+    mine = _name_words(series_name)
+    theirs = _name_words(entry.get("name")) | _name_words(entry.get("oname"))
+    if not mine or not theirs:
+        return True
+    return bool(mine & theirs)
+
+
+def tmdb_hot(entry, today, aired_days, upcoming_days=HOT_UPCOMING_DAYS) -> bool:
+    """Airing by TMDB's schedule: an episode aired within `aired_days`, or the
+    next one airs within `upcoming_days`.
+
+    A cached "next episode" date that has since passed still counts until it
+    is `aired_days` old, so a show can't drop out of hot just because the
+    cache hasn't caught up with the premiere yet.
+    """
+    from datetime import timedelta
+    if not entry:
+        return False
+    lo = today - timedelta(days=aired_days)
+    last = _to_date(entry.get("last"))
+    if last is not None and lo <= last <= today + timedelta(days=1):
+        return True
+    nxt = _to_date(entry.get("next"))
+    if nxt is not None and lo <= nxt <= today + timedelta(days=upcoming_days):
+        return True
+    return False
+
+
+def tmdb_recheck_seconds(entry, today, aired_days) -> float:
+    """How long a cached TMDB entry stays current.
+
+    Hot or premiering soon: 2 days, so airing schedules stay accurate. Ended or
+    canceled: 30 days. Not found: 30 days. A failed lookup: 1 day. Anything
+    else (returning, in production): 7 days.
+    """
+    from datetime import timedelta
+    day = 86400.0
+    if not entry:
+        return 0.0
+    err = entry.get("err")
+    if err == "not_found":
+        return 30 * day
+    if err:
+        return 1 * day
+    nxt = _to_date(entry.get("next"))
+    if tmdb_hot(entry, today, aired_days) or (
+            nxt is not None and nxt <= today + timedelta(days=14)):
+        return 2 * day
+    if str(entry.get("st") or "") in ("Ended", "Canceled", "Cancelled"):
+        return 30 * day
+    return 7 * day
+
+
+def fallback_hot(signals, today, now_epoch, days) -> bool:
+    """Airing by stored data, for a series TMDB has nothing usable for.
+
+    Hot when an episode's stored air date falls within `days` (or in the
+    future), or an episode was first seen within `days`. "First seen" is only
+    trustworthy over short windows: most stored episodes were first fetched
+    when this plugin began refreshing everything.
+    """
+    from datetime import timedelta
+    if not signals:
+        return False
+    last_air = _to_date(signals.get("last_air"))
+    if last_air is not None and last_air >= today - timedelta(days=days):
+        return True
+    last_new = _epoch_of(signals.get("last_new"))
+    if last_new is not None and last_new >= now_epoch - days * 86400.0:
+        return True
+    return False
+
+
+def _norm_tmdb_id(value):
+    """A TMDB TV id as a digits-only string, or None."""
+    s = str(value or "").strip()
+    if s.lower().startswith("tv/"):
+        s = s[3:]
+    return s if s.isdigit() and s != "0" else None
+
+
+def classify_hot(series_pks, signals, tmdb_items, cfg, today, now_epoch):
+    """(hot series set, counts) -- which watched series are airing.
+
+    `counts`: tmdb (hot by TMDB), fallback (hot by stored dates), known (with a
+    usable TMDB entry), mismatch (TMDB entry rejected by the sanity check).
+    """
+    hot = set()
+    counts = {"tmdb": 0, "fallback": 0, "known": 0, "mismatch": 0}
+    for pk in series_pks:
+        sig = signals.get(pk) or {}
+        entry = None
+        tid = _norm_tmdb_id(sig.get("tmdb_id"))
+        if tid and tmdb_items:
+            entry = tmdb_items.get(tid)
+        if entry and not entry.get("err"):
+            if tmdb_sane(sig.get("name"), sig.get("year"), entry):
+                counts["known"] += 1
+                if tmdb_hot(entry, today, cfg["hot_aired_days"]):
+                    hot.add(pk)
+                    counts["tmdb"] += 1
+                continue
+            counts["mismatch"] += 1
+        if fallback_hot(sig, today, now_epoch, cfg["fallback_hot_days"]):
+            hot.add(pk)
+            counts["fallback"] += 1
+    return hot, counts
+
+
+def update_misses(prev_pairs, prev_epoch, rows, misses):
+    """Carry forward what the previous run left undone.
+
+    A pair the previous sweep made due, with any relation still unrefreshed
+    since that sweep began, has missed one more run. Everything else drops
+    out. Pairs no longer present (unwatched, provider removed) drop out too.
+    """
+    if not isinstance(prev_pairs, dict) or not prev_epoch:
+        return {}
+    missed = set()
+    for row in rows:
+        key = _pair_key(row.get("m3u_account_id"), row.get("series_id"))
+        if key not in prev_pairs:
+            continue
+        ler = _epoch_of(row.get("last_episode_refresh"))
+        if ler is None or ler < float(prev_epoch):
+            missed.add(key)
+    return {k: int((misses or {}).get(k, 0) or 0) + 1 for k in missed}
+
+
+def compute_due(rows, hot, cfg, today, now_epoch, pending_new=(), misses=None):
+    """Decide what this run refreshes.
+
+    Returns ({(account_id, series_pk): tier}, noisy_account_ids). `rows` are
+    the watched relations of active XC accounts, each with
+    `last_episode_refresh` and the provider's `last_modified`
+    (PROVIDER_LM_FIELD). With tiering off every pair is due, as in 1.1.x.
+    """
+    rotation = max(1, int(cfg.get("rotation_days") or DEFAULT_ROTATION_DAYS))
+    tiered = bool(cfg.get("tiered", True))
+    promote = bool(cfg.get("provider_promotion", True))
+    misses = misses or {}
+    pending = {str(p) for p in (pending_new or ())}
+
+    pairs = {}   # (aid, sid) -> {"new", "oldest", "promoted"}
+    rel_n, promo_n = {}, {}
+    for row in rows:
+        aid, sid = row.get("m3u_account_id"), row.get("series_id")
+        if aid is None or sid is None:
+            continue
+        p = pairs.setdefault((aid, sid), {"new": False, "oldest": None, "promoted": False})
+        rel_n[aid] = rel_n.get(aid, 0) + 1
+        ler = _epoch_of(row.get("last_episode_refresh"))
+        if ler is None:
+            p["new"] = True
+            continue
+        p["oldest"] = ler if p["oldest"] is None else min(p["oldest"], ler)
+        lm = _provider_lm(row.get(PROVIDER_LM_FIELD), now_epoch)
+        if lm is not None and lm > ler:
+            if not p["promoted"]:
+                promo_n[aid] = promo_n.get(aid, 0) + 1
+            p["promoted"] = True
+
+    noisy = {
+        aid for aid, n in promo_n.items()
+        if n >= PROMOTION_NOISE_MIN and n > PROMOTION_NOISE_SHARE * rel_n.get(aid, 0)
+    }
+    slot = today.toordinal() % rotation
+    overdue_after = (rotation + OVERDUE_SLACK_DAYS) * 86400.0
+
+    due = {}
+    for (aid, sid), p in pairs.items():
+        key = _pair_key(aid, sid)
+        if p["new"] or str(sid) in pending:
+            tier = "n"
+        elif key in misses:
+            tier = "r"
+        elif not tiered:
+            tier = "c"
+        elif sid in hot:
+            tier = "h"
+        elif promote and p["promoted"] and aid not in noisy:
+            tier = "p"
+        elif (int(sid) % rotation == slot
+              or (p["oldest"] is not None and now_epoch - p["oldest"] > overdue_after)):
+            tier = "c"
+        else:
+            continue
+        due[(aid, sid)] = tier
+    return due, noisy
+
+
+def due_by_account(due, misses=None):
+    """({account_id: [series_pk, ...]}, rank) in dispatch priority order.
+
+    Order: tier (new, carried, hot, promoted, cold), then most runs missed,
+    then series id for determinism.
+    """
+    misses = misses or {}
+    rank = {}
+    by_account = {}
+    for (aid, sid), tier in due.items():
+        r = (TIER_RANK.get(tier, 9), -int(misses.get(_pair_key(aid, sid), 0) or 0), sid)
+        rank[(aid, sid)] = r
+        by_account.setdefault(aid, []).append(sid)
+    for aid in by_account:
+        by_account[aid].sort(key=lambda s, a=aid: rank[(a, s)])
+    return by_account, rank
+
+
+def update_chances(series, chances, visible, now, grace=CHANCE_GRACE_SECONDS):
+    """Count the bumps each watched series' client has ignored.
+
+    A chance is the client-visible `last_modified` (the top-priority
+    relation's `updated_at`, as core's `get_series` reports it) moving past the
+    series' last observation, with `grace` elapsed for the client to react.
+    Each distinct bump counts once. Failed refreshes never save the relation,
+    so they never count: a flaky provider cannot erode the watchlist.
+    """
+    out = {}
+    for key, seen in (series or {}).items():
+        entry = (chances or {}).get(key) or [0, None]
+        try:
+            count, last = int(entry[0]), entry[1]
+        except Exception:
+            count, last = 0, None
+        try:
+            v = (visible or {}).get(int(key))
+        except (TypeError, ValueError):
+            v = None
+        try:
+            if (v is not None and v > float(seen) and now - v >= grace
+                    and (last is None or float(last) != float(v))):
+                count, last = count + 1, v
+        except (TypeError, ValueError):
+            pass
+        if count:
+            out[key] = [count, last]
+    return out
+
+
+def is_expired(seen, chance_entry, now, ttl_seconds):
+    """Expire only when the client ignored CHANCES_TO_EXPIRE bumps AND the
+    series is older than the TTL -- or it hasn't been seen in the ceiling
+    (EXPIRY_CEILING_DAYS, or the TTL if that is longer)."""
+    try:
+        age = now - float(seen)
+    except (TypeError, ValueError):
+        return False
+    ceiling = max(EXPIRY_CEILING_DAYS * 86400.0, ttl_seconds)
+    if age > ceiling:
+        return True
+    try:
+        ignored = int((chance_entry or [0])[0])
+    except Exception:
+        ignored = 0
+    return age > ttl_seconds and ignored >= CHANCES_TO_EXPIRE
+
+
+# --- DB adapters (thin; the decisions above are pure) ----------------------- #
+
+_adapter_warned = set()
+
+
+def _warn_once(tag, exc):
+    if tag not in _adapter_warned:
+        _adapter_warned.add(tag)
+        logger.warning("[VOD-SWEEP] %s unavailable (%s); continuing without it",
+                       tag, _safe_err(exc))
+
+
+def _relation_rows(series_pks):
+    """Watched relations of active XC accounts, with what tiering needs.
+
+    The provider date is read through a JSON key transform. Should a database
+    or release ever reject that, the rows are fetched without it: promotion is
+    off for the run, but the sweep itself still runs.
+    """
+    from apps.m3u.models import M3UAccount
+    from apps.vod.models import M3USeriesRelation
+    base = ("m3u_account_id", "m3u_account__name", "series_id", "last_episode_refresh")
+
+    def _query(fields):
+        return list(
+            M3USeriesRelation.objects.filter(
+                series_id__in=series_pks,
+                m3u_account__is_active=True,
+                m3u_account__account_type=M3UAccount.Types.XC,
+            ).values(*fields)
+        )
+    try:
+        return _query(base + (PROVIDER_LM_FIELD,))
+    except Exception as exc:
+        _warn_once("provider change dates", exc)
+        return _query(base)
+
+
+def _series_signals(series_pks):
+    """{series_pk: {name, year, tmdb_id, last_air, last_new}} -- fail-open."""
+    try:
+        from django.db.models import Max
+        from apps.vod.models import Series
+        rows = (
+            Series.objects.filter(pk__in=series_pks)
+            .annotate(last_air=Max("episodes__air_date"),
+                      last_new=Max("episodes__created_at"))
+            .values("id", "name", "year", "tmdb_id", "last_air", "last_new")
+        )
+        return {r["id"]: r for r in rows}
+    except Exception as exc:
+        _warn_once("series air-date signals", exc)
+        return {}
+
+
+def _visible_bumps(series_pks):
+    """{series_pk: epoch} of the `updated_at` core's `get_series` would report
+    as `last_modified`: the active relation with the highest account priority,
+    lowest id first -- the same order as core's
+    `_xc_fetch_priority_distinct_relations`. Fail-open (empty)."""
+    try:
+        from apps.vod.models import M3USeriesRelation
+        rows = M3USeriesRelation.objects.filter(
+            series_id__in=series_pks, m3u_account__is_active=True,
+        ).values("series_id", "m3u_account__priority", "id", "updated_at")
+        best = {}
+        for r in rows:
+            if r.get("updated_at") is None:
+                continue
+            key = (-(r.get("m3u_account__priority") or 0), r.get("id") or 0)
+            cur = best.get(r["series_id"])
+            if cur is None or key < cur[0]:
+                best[r["series_id"]] = (key, _epoch_of(r["updated_at"]))
+        return {sid: ep for sid, (_, ep) in best.items() if ep is not None}
+    except Exception as exc:
+        _warn_once("client-visible bump times", exc)
+        return {}
+
+
+def _read_tmdb_cache() -> dict:
+    """{"items": {tmdb_id: entry}, "meta": {...}} -- fail-open (empty)."""
+    try:
+        from core.models import CoreSettings
+        row = CoreSettings.objects.filter(key=TMDB_CORE_KEY).values("value").first()
+        val = (row or {}).get("value") or {}
+        items = val.get("items") if isinstance(val, dict) else None
+        meta = val.get("meta") if isinstance(val, dict) else None
+        return {"items": items if isinstance(items, dict) else {},
+                "meta": meta if isinstance(meta, dict) else {}}
+    except Exception:
+        return {"items": {}, "meta": {}}
+
+
+def _write_tmdb_cache(items_update, meta_update) -> None:
+    """Merge into the TMDB cache row under a row lock."""
+    from django.db import transaction
+    from core.models import CoreSettings
+    with transaction.atomic():
+        row = CoreSettings.objects.select_for_update().filter(key=TMDB_CORE_KEY).first()
+        if row is None:
+            CoreSettings.objects.create(
+                key=TMDB_CORE_KEY, name=TMDB_CORE_NAME,
+                value={"items": dict(items_update or {}), "meta": dict(meta_update or {})},
+            )
+            return
+        val = row.value if isinstance(row.value, dict) else {}
+        items = val.get("items") if isinstance(val.get("items"), dict) else {}
+        meta = val.get("meta") if isinstance(val.get("meta"), dict) else {}
+        items.update(items_update or {})
+        meta.update(meta_update or {})
+        row.value = {"items": items, "meta": meta}
+        row.save(update_fields=["value"])
 
 
 def _last_sweep_epoch():
@@ -828,7 +1417,7 @@ def _stale_rows(series_pks, hours=STALE_HOURS):
     from apps.vod.models import M3USeriesRelation
 
     cutoff = _stale_cutoff(hours)
-    return list(
+    rows = list(
         M3USeriesRelation.objects.filter(
             series_id__in=series_pks,
             m3u_account__is_active=True,
@@ -838,6 +1427,36 @@ def _stale_rows(series_pks, hours=STALE_HOURS):
         .values("m3u_account_id", "m3u_account__name", "series_id",
                 "last_episode_refresh")
     )
+    return _restrict_to_due(rows)
+
+
+def _restrict_to_due(rows):
+    """Keep only stale rows the last sweep actually made DUE.
+
+    With tiered refresh most relations are deliberately left alone on most
+    days, so "not refreshed since the sweep began" would flag nearly every cold
+    show. Stale therefore means "due in the last sweep and still not refreshed"
+    -- plus anything never refreshed at all, which is always due. Each kept row
+    is annotated with how many earlier runs it was already due and missed
+    (`_misses`) and its tier (`_tier`), which drive the age buckets and retry
+    order.
+
+    With no recorded due set (a sweep from before 1.2.0, or none yet) every
+    watched relation counts, which is exactly the 1.1.x definition.
+    """
+    data = get_watchlist()
+    due = (data.get("due") or {}).get("pairs")
+    if not isinstance(due, dict):
+        return rows
+    misses = data.get("misses") or {}
+    out = []
+    for row in rows:
+        key = _pair_key(row.get("m3u_account_id"), row.get("series_id"))
+        if key in due or row.get("last_episode_refresh") is None:
+            row["_misses"] = int(misses.get(key, 0) or 0)
+            row["_tier"] = due.get(key, "n")
+            out.append(row)
+    return out
 
 
 def _stale_cycles(last_refresh, now) -> int:
@@ -849,6 +1468,22 @@ def _stale_cycles(last_refresh, now) -> int:
     except Exception:
         return 0
     return max(1, int(hours // 24))
+
+
+def _row_cycles(row, now) -> int:
+    """Age of a stale row in runs (0 == never refreshed).
+
+    A row from a due set counts the runs it has been due and missed, today's
+    included: 1 = due today, 2 = also missed the previous run. Elapsed time
+    would be wrong there, because a cold show legitimately goes a week between
+    refreshes. Rows without that annotation (no due set yet) fall back to
+    elapsed days, the 1.1.x measure.
+    """
+    if row.get("last_episode_refresh") is None:
+        return 0
+    if "_misses" in row:
+        return 1 + int(row.get("_misses") or 0)
+    return _stale_cycles(row.get("last_episode_refresh"), now)
 
 
 def _stale_age_buckets(rows, now=None):
@@ -869,7 +1504,7 @@ def _stale_age_buckets(rows, now=None):
         now = dj_tz.now()
     out = {"never": 0, "1": 0, "2": 0, "3+": 0}
     for row in rows:
-        cycles = _stale_cycles(row.get("last_episode_refresh"), now)
+        cycles = _row_cycles(row, now)
         if cycles == 0:
             out["never"] += 1
         elif cycles >= 3:
@@ -911,20 +1546,22 @@ def _stale_series_by_account(series_pks, hours=STALE_HOURS, rows=None, now=None)
         from django.utils import timezone as dj_tz
         now = dj_tz.now()
 
-    worst = {}  # (account_id, series_id) -> max cycles stale
+    worst = {}  # (account_id, series_id) -> (max cycles stale, best tier rank)
     for row in rows:
         key = (row["m3u_account_id"], row["series_id"])
-        cycles = _stale_cycles(row.get("last_episode_refresh"), now)
+        cycles = _row_cycles(row, now)
         # 0 means "never refreshed" -- treat as the most stale of all.
         rank = float("inf") if cycles == 0 else cycles
-        if rank > worst.get(key, -1):
-            worst[key] = rank
+        tier = TIER_RANK.get(row.get("_tier"), 0)
+        prev_rank, prev_tier = worst.get(key, (-1, 99))
+        worst[key] = (max(rank, prev_rank), min(tier, prev_tier))
 
     by_account = {}
-    for (account_id, series_id), rank in worst.items():
-        by_account.setdefault(account_id, []).append((rank, series_id))
+    for (account_id, series_id), (rank, tier) in worst.items():
+        by_account.setdefault(account_id, []).append((rank, tier, series_id))
+    # Equally stale: airing shows before cold ones.
     return {
-        aid: [sid for _, sid in sorted(pairs, key=lambda p: (-p[0], p[1]))]
+        aid: [sid for _, _, sid in sorted(pairs, key=lambda p: (-p[0], p[1], p[2]))]
         for aid, pairs in by_account.items()
     }
 
@@ -995,12 +1632,14 @@ def _provider_reachable(account_id, attempts=2) -> bool:
     return False
 
 
-def _filter_reachable(by_account, summary):
+def _filter_reachable(by_account, summary, names=None):
     """Drop accounts whose panel is not answering, recording each skip.
 
     A skip is recorded in the summary AND logged at warning level on purpose: a
     quietly smaller sweep, a climbing stale count and no explanation is exactly
-    the silent degradation this plugin exists to make visible.
+    the silent degradation this plugin exists to make visible. Names are
+    recorded alongside ids when known, because status shows them and a bare
+    database id meant nothing to the person reading it.
     """
     reachable = {}
     for account_id, account_pks in by_account.items():
@@ -1008,6 +1647,8 @@ def _filter_reachable(by_account, summary):
             reachable[account_id] = account_pks
         else:
             summary["skipped_accounts"].append(account_id)
+            if names and names.get(account_id):
+                summary.setdefault("skipped_names", []).append(str(names[account_id]))
     if summary["skipped_accounts"]:
         logger.warning(
             "[VOD-SWEEP] skipped %s unreachable account(s) this pass: %s",
@@ -1016,39 +1657,51 @@ def _filter_reachable(by_account, summary):
     return reachable
 
 
-def _dispatch_refresh(by_account, batch_size, spacing):
+def _dispatch_refresh(by_account, batch_size, spacing, rank=None):
     """Chunk each account's series and enqueue the CORE refresh task with a
     staggered countdown. Returns (tasks_enqueued, spread_seconds).
 
     Shared by the daily sweep and the stale-retry pass so both throttle
     identically. Fail-open per chunk: a broker error is logged and skipped
     rather than aborting the pass.
+
+    Each account's list is expected in priority order already. With `rank`
+    ({(account_id, series_pk): sortable}), chunks from ALL accounts are also
+    interleaved by the rank of their first series, so one account's cold
+    shows never queue ahead of another account's new or airing ones.
     """
     from apps.vod.tasks import batch_refresh_series_episodes
 
-    tasks = 0
-    idx = 0  # global chunk index -> staggered countdown across all accounts
-    for account_id, account_pks in by_account.items():
+    planned = []  # (sort key, account_id, chunk)
+    for a_idx, (account_id, account_pks) in enumerate(by_account.items()):
         if batch_size and batch_size > 0:
             chunks = [account_pks[i:i + batch_size]
                       for i in range(0, len(account_pks), batch_size)]
         else:
             chunks = [account_pks]
-        for chunk in chunks:
-            countdown = int(idx * spacing) if spacing > 0 else 0
-            try:
-                batch_refresh_series_episodes.apply_async(
-                    args=[account_id], kwargs={"series_ids": chunk},
-                    countdown=countdown,
-                )
-                tasks += 1
-                idx += 1
-            except Exception as exc:
-                logger.warning("[VOD-SWEEP] enqueue failed account=%s: %s", account_id, exc)
+        for c_idx, chunk in enumerate(chunks):
+            first = rank.get((account_id, chunk[0]), ()) if (rank and chunk) else ()
+            planned.append(((first, c_idx, a_idx) if rank else (a_idx, c_idx),
+                            account_id, chunk))
         logger.info(
-            "[VOD-SWEEP] queued %s task(s) for account=%s (%s watched series)",
+            "[VOD-SWEEP] queueing %s task(s) for account=%s (%s series)",
             len(chunks), account_id, len(account_pks),
         )
+    planned.sort(key=lambda p: p[0])
+
+    tasks = 0
+    idx = 0  # global chunk index -> staggered countdown across all accounts
+    for _, account_id, chunk in planned:
+        countdown = int(idx * spacing) if spacing > 0 else 0
+        try:
+            batch_refresh_series_episodes.apply_async(
+                args=[account_id], kwargs={"series_ids": chunk},
+                countdown=countdown,
+            )
+            tasks += 1
+            idx += 1
+        except Exception as exc:
+            logger.warning("[VOD-SWEEP] enqueue failed account=%s: %s", account_id, exc)
     spread = int((idx - 1) * spacing) if (idx and spacing > 0) else 0
     return tasks, spread
 
@@ -1099,27 +1752,64 @@ def _write_debug_file(last_sweep=None):
         return None
 
 
-def _prune_expired(ttl_seconds):
+def _prune_expired(ttl_seconds, visible=None):
+    """Update each series' ignored-bump count, then drop what has expired.
+
+    1.1.x dropped anything unseen for the TTL. That relied on every watched
+    show being bumped daily; with tiered refresh an old show is bumped weekly
+    at best, and only when its top provider answers, so a time-only rule would
+    quietly drop shows the client still follows. See `update_chances` and
+    `is_expired`. `visible` is {series_pk: client-visible bump epoch}; None
+    leaves the counts untouched (only the ceiling can then expire anything).
+    """
     if ttl_seconds <= 0:
         return 0
-    cutoff = time.time() - ttl_seconds
+    now = time.time()
     pruned = {"n": 0}
 
     def _mut(data):
         series = data["series"]
-        stale = [k for k, v in series.items() if float(v) < cutoff]
-        for k in stale:
+        chances = data.get("chances") if isinstance(data.get("chances"), dict) else {}
+        changed = False
+        if visible is not None:
+            new_chances = update_chances(series, chances, visible, now)
+            if new_chances != chances:
+                changed = True
+            chances = new_chances
+            data["chances"] = chances
+        gone = [k for k, v in series.items() if is_expired(v, chances.get(k), now, ttl_seconds)]
+        for k in gone:
             series.pop(k, None)
-        pruned["n"] = len(stale)
-        return bool(stale)
+            chances.pop(k, None)
+        if gone:
+            pending = data.get("pending_new")
+            if isinstance(pending, list):
+                data["pending_new"] = [p for p in pending if p not in set(gone)]
+        pruned["n"] = len(gone)
+        return changed or bool(gone)
 
     _mutate_watchlist(_mut)
     return pruned["n"]
 
 
-def _record_sweep_result(summary) -> None:
+def _record_sweep_state(summary, due_pairs=None, misses=None, dispatched=None) -> None:
+    """Persist a sweep's record, its due set and carried-over counts together,
+    so staleness audits always read a due set that matches `last_sweep`.
+
+    `dispatched` is the set of series pks actually sent to a provider; those
+    leave the "new to the watchlist" queue. A new series whose only provider
+    was unreachable stays queued for the next run.
+    """
     def _mut(data):
         data["last_sweep"] = summary
+        if due_pairs is not None:
+            data["due"] = {"at_epoch": summary.get("at_epoch"), "pairs": due_pairs}
+            data["misses"] = dict(misses or {})
+        if dispatched:
+            done = {str(p) for p in dispatched}
+            pending = data.get("pending_new")
+            if isinstance(pending, list):
+                data["pending_new"] = [p for p in pending if str(p) not in done]
         return True
     _mutate_watchlist(_mut)
 
@@ -1154,9 +1844,9 @@ def format_run_record(label, rec) -> str:
         bits.append(f"{rec['retried_series']} retried")
     bits.append(f"{rec.get('accounts', 0)} acct")
     bits.append(f"{rec.get('tasks', 0)} tasks")
-    bits.append(f"~{rec.get('spread_seconds', 0)}s")
-    if rec.get("auto_retry_passes"):
-        bits.append(f"retry x{rec['auto_retry_passes']}")
+    # No dispatch spread or "retry xN" here (1.2.0): the header already shows
+    # the retry setting, both are in the logs, and the tier counts needed the
+    # room in the toast.
     if rec.get("trigger"):
         bits.append(str(rec["trigger"]))
     out = f"{label}: " + " | ".join(bits)
@@ -1167,12 +1857,15 @@ def format_run_record(label, rec) -> str:
         out += f" | stale before {rec['stale_total']}"
     if rec.get("skipped"):
         out += f" | skipped: {rec['skipped']}"
-    if rec.get("skipped_accounts"):
+    if rec.get("skipped_names"):
+        out += f" | UNREACHABLE {', '.join(rec['skipped_names'])}"
+    elif rec.get("skipped_accounts"):
         out += f" | UNREACHABLE {rec['skipped_accounts']}"
     return out
 
 
-def build_status_message(cfg, watchlist, live, pid, active, id_mode=None) -> str:
+def build_status_message(cfg, watchlist, live, pid, active, id_mode=None,
+                         tmdb=None) -> str:
     """Assemble the status action's message.
 
     This lives here rather than in plugin.py so it can be TESTED. The UI's
@@ -1197,21 +1890,36 @@ def build_status_message(cfg, watchlist, live, pid, active, id_mode=None) -> str
 
     # Settings echo, terse on purpose: it duplicates the settings page and is
     # here only so a pasted status carries its own context. Defaults-shaped
-    # values stay quiet; the abnormal states are spelled out in capitals.
+    # values stay quiet (queue, TTL); the abnormal states are spelled out in
+    # capitals.
+    extras = ""
+    if cfg.get("schedule_queue", DEFAULT_SCHEDULE_QUEUE) != DEFAULT_SCHEDULE_QUEUE:
+        extras += f" q={cfg['schedule_queue']}"
+    if round(cfg["ttl_seconds"] / 86400.0) != DEFAULT_TTL_DAYS:
+        extras += f" ttl={cfg['ttl_seconds'] / 86400.0:.0f}d"
+    # Today's due set by tier (new / carried / hot / promoted / cold), from the
+    # last sweep -- how much of the watchlist a run actually touches.
+    due = (watchlist.get("last_sweep") or {}).get("due") or {}
+    if not cfg.get("tiered", True):
+        tiers = " TIERS OFF"
+    elif due:
+        tiers = " due " + " ".join(f"{t}{due.get(t, 0)}" for t in ("n", "r", "h", "p", "c"))
+    else:
+        tiers = ""
     head = (
         f"{'' if active else 'PATCH INACTIVE '}pid={pid} xc_ids={id_mode or '?'} "
-        f"watched={len(watchlist.get('series', {}))}\n"
+        f"watched={len(watchlist.get('series', {}))}"
+        f"{(' tmdb ' + tmdb) if tmdb else ''}\n"
         f"sweep {cfg['sweep_hour']:02d}:00"
         f"{'' if cfg['scheduled_sweep'] else ' AUTO-RUN OFF'} "
-        f"q={cfg['schedule_queue']} retry={retry} "
-        f"batch={cfg['batch_size']}/{cfg['spacing_seconds']:.0f}s "
-        f"ttl={cfg['ttl_seconds'] / 86400.0:.0f}d"
+        f"retry={retry} batch={cfg['batch_size']}/{cfg['spacing_seconds']:.0f}s"
+        f"{extras}{tiers}"
     )
 
     stale = f"STALE NOW {live.get('total', 0)}"
     if by_acct:
         stale += f" | {by_acct}"
-    stale += f"\nage(cycles): {age_str}"
+    stale += f"\nage(runs): {age_str}"
     if live.get("error"):
         stale += f"\naudit error: {live['error']}"
 
@@ -1255,9 +1963,10 @@ def live_stale_summary() -> dict:
 
 
 def run_sweep_impl() -> dict:
-    """Refresh every relation of each watched series, per carrying XC account, by
-    enqueuing the CORE batch_refresh_series_episodes task. Runs inline in the
-    calling (web) worker. Fail-open; safe to call from anywhere."""
+    """Refresh every relation of each DUE watched series (all of them with
+    tiering off), per carrying XC account, by enqueuing the CORE
+    batch_refresh_series_episodes task. Runs inline in the calling (web)
+    worker. Fail-open; safe to call from anywhere."""
     from django.db import close_old_connections
 
     summary = {
@@ -1276,13 +1985,16 @@ def run_sweep_impl() -> dict:
             return summary
 
         cfg = _load_config(force=True)
-        summary["pruned"] = _prune_expired(cfg["ttl_seconds"])
+        before = get_watchlist(force=True)
+        before_pks = [int(k) for k in before.get("series", {}).keys() if str(k).isdigit()]
+        visible = _visible_bumps(before_pks) if before_pks else {}
+        summary["pruned"] = _prune_expired(cfg["ttl_seconds"], visible=visible)
 
         data = get_watchlist(force=True)
         pks = [int(k) for k in data.get("series", {}).keys() if str(k).isdigit()]
         summary["watched"] = len(pks)
         if not pks:
-            _record_sweep_result(summary)
+            _record_sweep_state(summary, due_pairs={}, misses={})
             _write_debug_file(last_sweep=summary)
             logger.info("[VOD-SWEEP] sweep: watchlist empty, nothing to do")
             return summary
@@ -1303,16 +2015,53 @@ def run_sweep_impl() -> dict:
         except Exception:
             logger.debug("[VOD-SWEEP] staleness audit failed (ignored)", exc_info=True)
 
-        by_account = _accounts_by_series(pks)
+        # Decide what is due (see "Tiered refresh").
+        rows = _relation_rows(pks)
+        names = {r["m3u_account_id"]: r.get("m3u_account__name") for r in rows}
+        prev_due = data.get("due") or {}
+        misses = update_misses(prev_due.get("pairs"), prev_due.get("at_epoch"),
+                               rows, data.get("misses"))
+        today = _now_local().date()
+        now_epoch = time.time()
+        if cfg["tiered"]:
+            signals = _series_signals(pks)
+            items = _read_tmdb_cache()["items"] if cfg["tmdb_key"] else {}
+            hot, hot_counts = classify_hot(pks, signals, items, cfg, today, now_epoch)
+            summary["tmdb_known"] = hot_counts["known"]
+            summary["tmdb_ids"] = sum(
+                1 for s in signals.values() if _norm_tmdb_id(s.get("tmdb_id")))
+            summary["tmdb_mismatch"] = hot_counts["mismatch"]
+        else:
+            hot = set()
+        due, noisy = compute_due(rows, hot, cfg, today, now_epoch,
+                                 pending_new=data.get("pending_new") or (),
+                                 misses=misses)
+        counts = {}
+        for tier in due.values():
+            counts[tier] = counts.get(tier, 0) + 1
+        summary["due"] = counts
+        summary["due_pairs"] = len(due)
+        if noisy:
+            summary["noisy_accounts"] = sorted(str(names.get(a, a)) for a in noisy)
+            logger.warning(
+                "[VOD-SWEEP] ignoring provider change dates this run for %s: "
+                "too many relations changed at once to be real news",
+                summary["noisy_accounts"],
+            )
+        by_account, rank = due_by_account(due, misses)
+        due_pairs = {_pair_key(a, s): t for (a, s), t in due.items()}
 
         # Pre-flight each account before fanning out: one request apiece saves
-        # hundreds of doomed refreshes when a provider's panel is down.
-        by_account = _filter_reachable(by_account, summary)
+        # hundreds of doomed refreshes when a provider's panel is down. A
+        # skipped account's pairs stay in the due set, so they read as stale
+        # and are carried into the next run.
+        by_account = _filter_reachable(by_account, summary, names)
         summary["accounts"] = len(by_account)
 
         summary["tasks"], summary["spread_seconds"] = _dispatch_refresh(
-            by_account, cfg["batch_size"], cfg["spacing_seconds"],
+            by_account, cfg["batch_size"], cfg["spacing_seconds"], rank=rank,
         )
+        dispatched = {s for sids in by_account.values() for s in sids}
 
         # Arm the auto-retry chain. It must not audit until this sweep's tasks
         # have actually RUN -- they carry countdowns up to spread_seconds -- so
@@ -1327,13 +2076,20 @@ def run_sweep_impl() -> dict:
             ):
                 summary["auto_retry_passes"] = cfg["retry_passes"]
 
-        _record_sweep_result(summary)
+        # Keep the TMDB cache current for the NEXT run, after this run's
+        # refreshes are queued so a slow TMDB never delays them.
+        if cfg["tiered"] and cfg["tmdb_key"]:
+            schedule_tmdb_refresh(TMDB_FIRST_DELAY_SECONDS, reason="after sweep")
+
+        _record_sweep_state(summary, due_pairs=due_pairs, misses=misses,
+                            dispatched=dispatched)
         _write_debug_file(last_sweep=summary)
         logger.info(
-            "[VOD-SWEEP] sweep done: %s series across %s account(s), %s task(s) "
-            "spread over ~%ss, %s pruned, %s stale",
-            summary["watched"], summary["accounts"], summary["tasks"],
-            summary["spread_seconds"], summary["pruned"], summary["stale_total"],
+            "[VOD-SWEEP] sweep done: %s watched, %s due %s, %s account(s), %s "
+            "task(s) spread over ~%ss, %s pruned, %s stale before",
+            summary["watched"], summary["due_pairs"], summary["due"],
+            summary["accounts"], summary["tasks"], summary["spread_seconds"],
+            summary["pruned"], summary["stale_total"],
         )
         return summary
     except Exception:
@@ -1476,7 +2232,8 @@ def retry_stale_impl(trigger="manual") -> dict:
             logger.info("[VOD-SWEEP] retry: nothing stale, nothing to do")
             return summary
 
-        by_account = _filter_reachable(by_account, summary)
+        names = {r.get("m3u_account_id"): r.get("m3u_account__name") for r in rows}
+        by_account = _filter_reachable(by_account, summary, names)
         summary["accounts"] = len(by_account)
         summary["retried_series"] = sum(len(v) for v in by_account.values())
 
@@ -1500,6 +2257,194 @@ def retry_stale_impl(trigger="manual") -> dict:
             close_old_connections()
         except Exception:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# TMDB lookups (background; keeps the schedule cache current)
+# --------------------------------------------------------------------------- #
+# TMDB decides refresh CADENCE only. It never adds or removes a watched series:
+# only the client's syncs say what is followed. The sweep reads the cache from
+# earlier runs, so a slow or unreachable TMDB never delays a refresh, and any
+# series without a usable entry falls back to stored air dates.
+
+class TmdbAuthError(Exception):
+    pass
+
+
+class TmdbRateLimited(Exception):
+    pass
+
+
+def _tmdb_err(exc) -> str:
+    """Error text safe to log: `requests` puts the full URL -- api_key query
+    parameter included -- into its connection errors."""
+    import re
+    msg = re.sub(r"api_key=[^&\s'\"]+", "api_key=***", str(exc))
+    msg = re.split(r"\s(?:for|with) url", msg)[0].strip()
+    return f"{type(exc).__name__}: {msg[:80]}" if msg else type(exc).__name__
+
+
+def _tmdb_fetch(tmdb_id, key) -> dict:
+    """One TMDB TV lookup -> a compact cache entry (without `f`).
+
+    Accepts either credential TMDB issues: a v4 read-access token (sent as a
+    bearer header) or a v3 API key (sent as a query parameter).
+    """
+    import requests
+    headers = {"Accept": "application/json"}
+    params = {}
+    if key.startswith("eyJ"):
+        headers["Authorization"] = f"Bearer {key}"
+    else:
+        params["api_key"] = key
+    resp = requests.get(f"{TMDB_API_BASE}/tv/{tmdb_id}", params=params,
+                        headers=headers, timeout=TMDB_TIMEOUT_SECONDS)
+    if resp.status_code == 404:
+        return {"err": "not_found"}
+    if resp.status_code in (401, 403):
+        raise TmdbAuthError(f"HTTP {resp.status_code}")
+    if resp.status_code == 429:
+        raise TmdbRateLimited("HTTP 429")
+    resp.raise_for_status()
+    d = resp.json() or {}
+    first = str(d.get("first_air_date") or "")
+    return {
+        "name": d.get("name"),
+        "oname": d.get("original_name"),
+        "year": int(first[:4]) if first[:4].isdigit() else None,
+        "st": d.get("status"),
+        "last": (d.get("last_episode_to_air") or {}).get("air_date"),
+        "next": (d.get("next_episode_to_air") or {}).get("air_date"),
+    }
+
+
+def tmdb_lookups_due(tmdb_ids, items, today, now_epoch, aired_days):
+    """TMDB ids whose cache entry is missing or past its re-check time.
+
+    Never-looked-up ids first, then the longest-unchecked.
+    """
+    due = []
+    for tid in tmdb_ids:
+        entry = items.get(tid)
+        if not entry:
+            due.append((0, 0.0, tid))
+            continue
+        fetched = float(entry.get("f") or 0)
+        if now_epoch - fetched >= tmdb_recheck_seconds(entry, today, aired_days):
+            due.append((1, fetched, tid))
+    return [tid for _, _, tid in sorted(due)]
+
+
+def schedule_tmdb_refresh(after_seconds=0, reason="") -> bool:
+    """Queue a TMDB lookup run on the plugin-capable queue (fail-open)."""
+    try:
+        cfg = _load_config()
+        run_tmdb_refresh.apply_async(
+            countdown=max(0, int(after_seconds)), queue=cfg["schedule_queue"],
+        )
+        logger.info("[VOD-SWEEP] TMDB lookups queued in %ss (%s)", int(after_seconds), reason)
+        return True
+    except Exception as exc:
+        logger.warning("[VOD-SWEEP] could not queue TMDB lookups: %s", _safe_err(exc))
+        return False
+
+
+@shared_task(name=TMDB_TASK_PATH)
+def run_tmdb_refresh():
+    return tmdb_refresh_impl()
+
+
+def tmdb_refresh_impl() -> dict:
+    """Refresh up to TMDB_BATCH stale cache entries; re-queue while more are
+    due and the day's budget lasts. Stops at once on a rejected key or a rate
+    limit. Fail-open throughout."""
+    from django.db import close_old_connections
+    summary = {"looked_up": 0, "remaining": 0, "stopped": None, "skipped": None}
+    try:
+        if not is_enabled():
+            summary["skipped"] = "plugin disabled"
+            return summary
+        cfg = _load_config(force=True)
+        key = cfg["tmdb_key"]
+        if not key or not cfg["tiered"]:
+            summary["skipped"] = "no TMDB key" if not key else "tiers off"
+            return summary
+        data = get_watchlist(force=True)
+        pks = [int(k) for k in data.get("series", {}).keys() if str(k).isdigit()]
+        signals = _series_signals(pks)
+        ids = sorted({t for t in (_norm_tmdb_id(s.get("tmdb_id")) for s in signals.values()) if t})
+        cache = _read_tmdb_cache()
+        items, meta = cache["items"], cache["meta"]
+        today = _now_local().date()
+        now = time.time()
+        day = today.isoformat()
+        used = int(meta.get("count") or 0) if meta.get("day") == day else 0
+        due = tmdb_lookups_due(ids, items, today, now, cfg["hot_aired_days"])
+        budget = max(0, min(TMDB_BATCH, TMDB_DAILY_CAP - used))
+
+        updates = {}
+        done = 0
+        for tid in due[:budget]:
+            try:
+                entry = _tmdb_fetch(tid, key)
+            except TmdbAuthError as exc:
+                summary["stopped"] = "TMDB rejected the key"
+                meta["auth_error"] = str(exc)
+                logger.warning("[VOD-SWEEP] TMDB rejected the API key (%s); "
+                               "falling back to stored air dates", exc)
+                break
+            except TmdbRateLimited:
+                summary["stopped"] = "rate limited"
+                logger.warning("[VOD-SWEEP] TMDB rate limit hit; resuming next run")
+                break
+            except Exception as exc:
+                entry = {"err": "error"}
+                logger.debug("[VOD-SWEEP] TMDB lookup %s failed: %s", tid, _tmdb_err(exc))
+            entry["f"] = time.time()
+            updates[tid] = entry
+            done += 1
+            if len(updates) >= TMDB_SAVE_EVERY:
+                _write_tmdb_cache(updates, {"day": day, "count": used + done})
+                updates = {}
+            if TMDB_SPACING_SECONDS > 0:
+                time.sleep(TMDB_SPACING_SECONDS)
+        if summary["stopped"] != "TMDB rejected the key":
+            meta.pop("auth_error", None)
+        _write_tmdb_cache(updates, {
+            "day": day, "count": used + done, "last_run": time.time(),
+            "auth_error": meta.get("auth_error"),
+        })
+        summary["looked_up"] = done
+        summary["remaining"] = max(0, len(due) - done)
+        if (summary["remaining"] and not summary["stopped"]
+                and used + done < TMDB_DAILY_CAP and done):
+            schedule_tmdb_refresh(5, reason="more lookups due")
+        logger.info("[VOD-SWEEP] TMDB: %s looked up, %s still due%s", done,
+                    summary["remaining"],
+                    f" ({summary['stopped']})" if summary["stopped"] else "")
+        return summary
+    except Exception:
+        logger.exception("[VOD-SWEEP] TMDB refresh failed (ignored)")
+        return summary
+    finally:
+        try:
+            close_old_connections()
+        except Exception:
+            pass
+
+
+def tmdb_status(cfg, watchlist) -> str:
+    """Short TMDB state for Show status: 'off', 'BAD KEY', or
+    '<known>/<with id>' (usable entries / watched series carrying a TMDB id)
+    as of the last sweep."""
+    if not cfg.get("tmdb_key"):
+        return "off"
+    if _read_tmdb_cache()["meta"].get("auth_error"):
+        return "BAD KEY"
+    last = (watchlist or {}).get("last_sweep") or {}
+    if last.get("tmdb_ids") is None:
+        return "pending"
+    return f"{last.get('tmdb_known', 0)}/{last.get('tmdb_ids', 0)}"
 
 
 # --------------------------------------------------------------------------- #

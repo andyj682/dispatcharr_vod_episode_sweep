@@ -56,11 +56,12 @@ class Plugin:
     # UI title only. README / repo / zip keep the fuller "Dispatcharr VOD
     # Episode Sweep" name; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Episode Sweep"
-    version = "1.1.1"
+    version = "1.2.0"
     description = (
-        "Learns which VOD series a client syncs and once a day refreshes ALL of "
-        "each watched show's provider/category relations so new episodes stop "
-        "going missing. Scoped to only the series you sync; runs in the background."
+        "Learns which VOD series a client syncs and refreshes ALL of each watched "
+        "show's provider/category relations so new episodes stop going missing: "
+        "airing shows daily, the rest on a rotation. Scoped to only the series "
+        "you sync; runs in the background."
     )
     author = "andyj682"
     help_url = "https://github.com/andyj682/dispatcharr_vod_episode_sweep"
@@ -115,14 +116,89 @@ class Plugin:
             ),
         },
         {
+            "id": "tiered_refresh",
+            "label": "Refresh by airing status",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "Refresh shows that are airing every day, and everything else on "
+                "a rotation (plus anything new, carried over, or reported changed "
+                "by its provider). Most watched shows aren't airing, so this cuts "
+                "the daily provider load sharply. Off = refresh every watched "
+                "show every day, as before 1.2.0."
+            ),
+        },
+        {
+            "id": "tmdb_api_key",
+            "label": "TMDB API key (optional)",
+            "type": "string",
+            "default": "",
+            "help_text": (
+                "A free TMDB key (v3 API key or v4 read access token) lets the "
+                "plugin follow each show's airing schedule: refreshed daily "
+                "around new episodes, and from a few days before a new season "
+                "starts. Only TMDB ids are sent. Without a key, stored episode "
+                "air dates are used instead. Falls back to Dispatcharr's "
+                "TMDB_API_KEY environment variable if that is set."
+            ),
+        },
+        {
+            "id": "hot_aired_days",
+            "label": "Airing window (days)",
+            "type": "number",
+            "default": 10,
+            "help_text": (
+                "How long after an episode airs (per TMDB) a show stays on the "
+                "daily refresh. Covers providers that post episodes late. Default "
+                "10."
+            ),
+        },
+        {
+            "id": "cold_rotation_days",
+            "label": "Rotation for other shows (days)",
+            "type": "number",
+            "default": 7,
+            "help_text": (
+                "Shows that aren't airing are still refreshed at least once every "
+                "this many days (1-28), spread evenly across the days. Lower = "
+                "fresher, more provider calls. Default 7."
+            ),
+        },
+        {
+            "id": "provider_promotion",
+            "label": "Refresh when a provider reports a change",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "Refresh a show the day its provider's listing says it changed "
+                "since the last refresh, whatever its airing status. Catches what "
+                "no schedule shows: a new copy of an old show, backfilled "
+                "seasons, fixed episodes. Ignored for a provider that marks most "
+                "of its listing changed at once. Default on."
+            ),
+        },
+        {
+            "id": "fallback_hot_days",
+            "label": "Fallback airing window (days)",
+            "type": "number",
+            "default": 14,
+            "help_text": (
+                "For shows without usable TMDB data: refreshed daily while a "
+                "stored episode air date (or a newly appeared episode) is within "
+                "this many days. Default 14."
+            ),
+        },
+        {
             "id": "watchlist_ttl_days",
             "label": "Watchlist TTL (days)",
             "type": "number",
             "default": 30,
             "help_text": (
-                "Drop a series from the watchlist if it hasn't been requested "
-                "(via get_series_info) for this many days. Keep this comfortably "
-                "longer than your client's sync interval. Default 30."
+                "A series leaves the watchlist only after this many days unseen "
+                "AND after your client has ignored 3 refreshes of it (or after "
+                "120 days unseen regardless), so a show refreshed only weekly, or "
+                "whose provider is having a bad week, isn't dropped while you "
+                "still follow it. Default 30."
             ),
         },
         {
@@ -208,6 +284,16 @@ class Plugin:
             "button_variant": "filled",
         },
         {
+            "id": "tmdb_refresh",
+            "label": "Update TMDB schedules",
+            "description": (
+                "Look up airing schedules on TMDB now (runs in the background; "
+                "needs a TMDB key). Also happens automatically after each sweep."
+            ),
+            "button_label": "Update TMDB",
+            "button_variant": "outline",
+        },
+        {
             "id": "clear_watchlist",
             "label": "Clear watchlist",
             "description": "Forget every watched series. It will be rebuilt as "
@@ -254,7 +340,29 @@ class Plugin:
                 "message": _patch.build_status_message(
                     cfg, wl, live, os.getpid(), _patch._ACTIVE,
                     id_mode=_patch._xc_series_id_mode(),
+                    tmdb=_patch.tmdb_status(cfg, wl),
                 ),
+            }
+
+        if action == "tmdb_refresh":
+            # Queued to the plugin-capable worker rather than run here: a
+            # first fill is hundreds of throttled lookups, too long for a web
+            # request.
+            cfg = _patch._load_config(force=True)
+            if not cfg.get("tmdb_key"):
+                return {"status": "error",
+                        "message": "No TMDB key set (plugin setting or the "
+                                   "TMDB_API_KEY environment variable)."}
+            if not cfg.get("tiered"):
+                return {"status": "error",
+                        "message": "Refresh by airing status is off, so TMDB "
+                                   "schedules aren't used."}
+            ok = _patch.schedule_tmdb_refresh(0, reason="manual")
+            return {
+                "status": "ok" if ok else "error",
+                "message": ("TMDB lookups queued; they run in the background. "
+                            "Show status reports coverage after the next sweep.")
+                           if ok else "Could not queue TMDB lookups (see logs).",
             }
 
         if action == "list_watchlist":
