@@ -256,4 +256,4 @@ with
 [`dispatcharr_vod_preferences`](https://github.com/andyj682/dispatcharr_vod_preferences),
 [`dispatcharr_vod_concurrency_fix`](https://github.com/andyj682/dispatcharr_vod_concurrency_fix),
 and
-[`dispatcharr_vod_episode_refresh`](https://github.com/andyj682/dispatcharr_vod_episode_refresh).
+[`dispatcharr_vod_merge`](https://github.com/andyj682/dispatcharr_vod_merge).
