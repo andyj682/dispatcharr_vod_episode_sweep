@@ -21,6 +21,7 @@
 #                       n new, r carried over, h airing, p provider change,
 #                       c rotation; "not due" = skipped that day.
 #   * NEXT ROTATION   = the next day it is refreshed even if not airing.
+#   * copy N          = the relation id; a provider can list a series twice.
 #   * last refresh    = when Dispatcharr last fetched that copy's episode list.
 # If the copy was refreshed after the episode should have appeared and the
 # episode is still missing, the provider simply hasn't posted it yet.
@@ -68,7 +69,8 @@ print("last sweep: %s" % (sw._fmt_epoch(due.get("at_epoch")) if due.get("at_epoc
 
 for s in found:
     pk = s.id
-    print("\n=== [%s] %s (%s) ===" % (pk, s.name, s.year or "?"))
+    yr = str(s.year or "")
+    print("\n=== [%s] %s%s ===" % (pk, s.name, " (%s)" % yr if yr and yr not in s.name else ""))
     if str(pk) not in watched:
         print("  NOT ON THE WATCHLIST -- the sweep never refreshes it. (It joins once your"
               " client requests it.)")
@@ -110,7 +112,13 @@ for s in found:
     ahead = (pk % rotation - slot) % rotation
     print("  NEXT ROTATION: %s" % ("today" if ahead == 0 else (today + timedelta(days=ahead)).isoformat()))
 
-    rows = sw._relation_rows([pk])
+    from apps.m3u.models import M3UAccount
+    from apps.vod.models import M3USeriesRelation
+    rows = list(M3USeriesRelation.objects.filter(
+        series_id=pk, m3u_account__is_active=True,
+        m3u_account__account_type=M3UAccount.Types.XC,
+    ).values("id", "m3u_account_id", "m3u_account__name", "last_episode_refresh",
+             sw.PROVIDER_LM_FIELD))
     if not rows:
         print("  no active XC provider copies.")
     for r in sorted(rows, key=lambda r: str(r.get("m3u_account__name"))):
@@ -118,8 +126,8 @@ for s in found:
         tier = pairs.get(key)
         ler = sw._epoch_of(r.get("last_episode_refresh"))
         lm = sw._provider_lm(r.get(sw.PROVIDER_LM_FIELD), now)
-        print("  - %-20s LAST SWEEP: %-22s last refresh %s | provider changed %s%s"
-              % (r.get("m3u_account__name"),
+        print("  - %-14s copy %-7s LAST SWEEP: %-22s last refresh %s | provider changed %s%s"
+              % (r.get("m3u_account__name"), r.get("id"),
                  ("%s (%s)" % (tier, TIERS.get(tier, "?"))) if tier else "not due",
                  sw._fmt_epoch(ler) if ler else "never",
                  sw._fmt_epoch(lm) if lm else "-",
