@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.2.0] - 2026-10-28
+## [1.2.0] - 2026-10-30
 
 Refreshes what can actually have changed instead of everything, every day.
 In practice most watched shows are not airing, so most of each day's provider
@@ -13,9 +13,9 @@ left the ones that mattered stale. Works on Dispatcharr 0.32.0 and 0.33.0.
 
 ### Added
 
-- **Prioritize refresh by airing status** (on by default). Each run refreshes what is
-  *due*, in priority order: relations never refreshed and series new to the
-  watchlist; anything due on an earlier run and still not refreshed; shows that
+- **Prioritize refresh by airing status** (on by default). Each run refreshes
+  what is *due*, in priority order: relations never refreshed and series new to
+  the watchlist; anything due on an earlier run and still not refreshed; shows that
   are airing; shows whose provider reports a change; and a rotating slice of
   everything else (every show at least weekly by default, plus anything past
   its rotation). Turning it off restores the 1.1.x behavior exactly.
@@ -45,10 +45,10 @@ left the ones that mattered stale. Works on Dispatcharr 0.32.0 and 0.33.0.
   and a newer sweep or Clear watchlist stops an older chain.
 - **Quiet window for retries** (optional, off by default): a time range, such
   as your client's library sync, when automatic retries make no provider calls.
-- **Update TMDB schedules** action, and new settings: Prioritize refresh by airing status,
-  TMDB API key, Airing window, Rotation for other shows, Refresh when a provider
-  reports a change, Fallback airing window, Max retry passes per day, Quiet
-  window for retries. *Max retry passes per day* replaces *Retry passes*, which
+- **Update TMDB schedules** action, and new settings: Prioritize refresh by
+  airing status, TMDB API key, Airing window, Rotation for other shows, Refresh
+  when a provider reports a change, Fallback airing window, Max retry passes per
+  day, Quiet window for retries. *Max retry passes per day* replaces *Retry passes*, which
   was a fixed count; the old setting is ignored.
 
 ### Changed
