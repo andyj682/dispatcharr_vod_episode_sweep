@@ -526,3 +526,26 @@ by a sweep — it won't exist until the first sweep or a `Clear watchlist`.)
 - Retiring the generator's own periodic refresh is safe once this is live: that
   refresh could only ever hit the top relation (XC limitation), which this
   plugin supersedes.
+
+## Background actions and the run lock (v1.2.1)
+
+Dispatcharr 0.34 stopped running plugin actions inside the web request. A
+plain action is handed to a background worker and the request waits about a
+minute for it; past that the UI shows a timeout, but the action keeps running.
+A sweep's own work (audit, due set, pre-flight probes, dispatch) can take
+longer than that, so **Run sweep now** and **Retry stale relations** are marked
+`"async": true`. That flag is honored without declaring a manifest version and
+ignored by older releases, so one build serves both. Progress goes through the
+action context's `report_progress` when it is present.
+
+The timeout made one existing gap more likely to bite: nothing stopped a second
+run from starting while the first was still dispatching, and a user who sees a
+timeout clicks again. A Redis `SET NX` lock (`vodsweep:run`, 30-minute TTL for
+a worker that dies holding it) now covers every sweep, however triggered, and
+manual retries. It spans only the deciding-and-queueing part; the refreshes
+themselves run as core tasks afterwards, so a deliberate second run once the
+first has returned is still allowed. Automatic retry passes don't take it:
+they are queued by the chain, never by a click, and the chain already stops
+superseded and duplicate passes on its own. Release checks the token, so a run
+whose lock expired never deletes someone else's. Without Redis, runs go ahead
+unlocked, matching the plugin's fail-open rule everywhere else.

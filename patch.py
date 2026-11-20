@@ -197,6 +197,14 @@ MAX_WATCHLIST = 20000           # defensive cap on watchlist size
 DAILY_PREFIX = "vodsweep:daily:"
 DAILY_KEY_TTL = 129600          # 36h, so the day-key self-expires
 
+# One sweep or manual retry at a time, cluster-wide (1.2.1). On Dispatcharr
+# 0.34 a button that outlasts the UI's wait shows a timeout while the work
+# carries on in the background; clicking again must not start a second run.
+# The TTL only matters if a worker dies holding the lock.
+RUN_LOCK_KEY = "vodsweep:run"
+RUN_LOCK_TTL = 1800
+RUN_LOCK_BUSY = "another sweep or retry is still running"
+
 # --- Tiered refresh (1.2.0) -------------------------------------------------
 # Most watched shows are not airing, so refreshing every relation every day
 # spends nearly all of the provider budget on shows that cannot have changed.
@@ -833,6 +841,53 @@ def _claim_daily(date_str) -> bool:
             return False
         _ip_daily_date = date_str
         return True
+
+
+def _acquire_run_lock():
+    """Claim the run lock. Returns a token to release with, "" when Redis is
+    unavailable (run unlocked: fail-open, as everywhere here), or None when
+    another run holds it."""
+    redis_client = _get_redis()
+    if redis_client is None:
+        return ""
+    token = f"{os.getpid()}:{time.time()}"
+    try:
+        ok = redis_client.set(RUN_LOCK_KEY, token, nx=True, ex=RUN_LOCK_TTL)
+    except Exception:
+        logger.debug("[VOD-SWEEP] run lock unavailable; running unlocked", exc_info=True)
+        return ""
+    return token if ok else None
+
+
+def _release_run_lock(token) -> None:
+    """Release only our own claim: after a TTL expiry the key may be someone
+    else's."""
+    if not token:
+        return
+    redis_client = _get_redis()
+    if redis_client is None:
+        return
+    try:
+        held = redis_client.get(RUN_LOCK_KEY)
+        if isinstance(held, bytes):
+            held = held.decode("utf-8", "replace")
+        if held == token:
+            redis_client.delete(RUN_LOCK_KEY)
+    except Exception:
+        logger.debug("[VOD-SWEEP] run lock release failed (expires on its own)",
+                     exc_info=True)
+
+
+def _progress(report, percent, message) -> None:
+    """Report progress to Dispatcharr 0.34+'s background-action UI. `report`
+    is the action context's `report_progress`, absent on older releases and
+    for scheduled runs. Never lets a progress failure touch the run."""
+    if report is None:
+        return
+    try:
+        report(int(percent), message)
+    except Exception:
+        logger.debug("[VOD-SWEEP] progress report failed (ignored)", exc_info=True)
 
 
 def _spawn_sweep(reason="daily") -> None:
@@ -2016,11 +2071,16 @@ def live_stale_summary() -> dict:
     return out
 
 
-def run_sweep_impl() -> dict:
+def run_sweep_impl(progress=None) -> dict:
     """Refresh every relation of each DUE watched series (all of them with
     tiering off), per carrying XC account, by enqueuing the CORE
-    batch_refresh_series_episodes task. Runs inline in the calling (web)
-    worker. Fail-open; safe to call from anywhere."""
+    batch_refresh_series_episodes task. Runs inline in the calling process
+    (the beat task's worker, or the action's). Fail-open; safe to call from
+    anywhere. `progress` is the action context's `report_progress`, if any.
+
+    Takes the run lock, so a second sweep or manual retry started while this
+    one is still deciding and dispatching returns at once instead.
+    """
     from django.db import close_old_connections
 
     summary = {
@@ -2033,10 +2093,17 @@ def run_sweep_impl() -> dict:
         "spread_seconds": 0, "stale_total": 0, "stale_by_account": {},
         "skipped_accounts": [], "auto_retry_passes": 0, "skipped": None,
     }
+    lock = None
     try:
         if not is_enabled():
             summary["skipped"] = "plugin disabled"
             return summary
+        lock = _acquire_run_lock()
+        if lock is None:
+            summary["skipped"] = RUN_LOCK_BUSY
+            logger.info("[VOD-SWEEP] sweep not started: %s", RUN_LOCK_BUSY)
+            return summary
+        _progress(progress, 5, "Reading the watchlist")
 
         cfg = _load_config(force=True)
         before = get_watchlist(force=True)
@@ -2070,6 +2137,7 @@ def run_sweep_impl() -> dict:
             logger.debug("[VOD-SWEEP] staleness audit failed (ignored)", exc_info=True)
 
         # Decide what is due (see "Tiered refresh").
+        _progress(progress, 20, "Deciding what is due")
         rows = _relation_rows(pks)
         names = {r["m3u_account_id"]: r.get("m3u_account__name") for r in rows}
         prev_due = data.get("due") or {}
@@ -2109,9 +2177,11 @@ def run_sweep_impl() -> dict:
         # hundreds of doomed refreshes when a provider's panel is down. A
         # skipped account's pairs stay in the due set, so they read as stale
         # and are carried into the next run.
+        _progress(progress, 50, "Checking providers")
         by_account = _filter_reachable(by_account, summary, names)
         summary["accounts"] = len(by_account)
 
+        _progress(progress, 80, "Queueing refreshes")
         summary["tasks"], summary["spread_seconds"] = _dispatch_refresh(
             by_account, cfg["batch_size"], cfg["spacing_seconds"], rank=rank,
         )
@@ -2165,6 +2235,7 @@ def run_sweep_impl() -> dict:
         logger.exception("[VOD-SWEEP] sweep failed (ignored)")
         return summary
     finally:
+        _release_run_lock(lock)
         try:
             close_old_connections()
         except Exception:
@@ -2487,7 +2558,7 @@ def run_retry(pass_no=1, sweep_at=None):
 # Stale-retry pass (manual, cheap counterpart to a full sweep)
 # --------------------------------------------------------------------------- #
 
-def retry_stale_impl(trigger="manual", chain_hook=None) -> dict:
+def retry_stale_impl(trigger="manual", chain_hook=None, progress=None) -> dict:
     """Re-refresh ONLY the relations currently flagged stale.
 
     Why this exists: a provider panel that fails a fraction of its requests at
@@ -2505,6 +2576,10 @@ def retry_stale_impl(trigger="manual", chain_hook=None) -> dict:
     on, or backing off after a failed pre-flight). With a hook the caller
     records the result, together with its chain state. A manual retry passes
     none, so it always tries every account: the operator asked for it.
+
+    A manual retry (no hook) takes the run lock, like the sweep. Chain passes
+    don't: they are queued by the chain itself, never by a click, and one
+    landing beside a manual run only re-sends refreshes, which is harmless.
     """
     from django.db import close_old_connections
 
@@ -2518,10 +2593,18 @@ def retry_stale_impl(trigger="manual", chain_hook=None) -> dict:
         "stale_by_id": {}, "dispatched_by_id": {}, "names_by_id": {},
     }
     record = _record_retry_result if chain_hook is None else (lambda _s: None)
+    lock = ""
     try:
         if not is_enabled():
             summary["skipped"] = "plugin disabled"
             return summary
+        if chain_hook is None:
+            lock = _acquire_run_lock()
+            if lock is None:
+                summary["skipped"] = RUN_LOCK_BUSY
+                logger.info("[VOD-SWEEP] retry not started: %s", RUN_LOCK_BUSY)
+                return summary
+        _progress(progress, 5, "Finding stale relations")
 
         cfg = _load_config(force=True)
         data = get_watchlist(force=True)
@@ -2562,11 +2645,13 @@ def retry_stale_impl(trigger="manual", chain_hook=None) -> dict:
         if chain_hook is not None:
             exclude = chain_hook(dict(by_id)) or set()
             by_account = {a: s for a, s in by_account.items() if str(a) not in exclude}
+        _progress(progress, 40, "Checking providers")
         by_account = _filter_reachable(by_account, summary, names)
         summary["accounts"] = len(by_account)
         summary["retried_series"] = sum(len(v) for v in by_account.values())
         summary["dispatched_by_id"] = {str(a): len(s) for a, s in by_account.items() if s}
 
+        _progress(progress, 80, "Queueing refreshes")
         summary["tasks"], summary["spread_seconds"] = _dispatch_refresh(
             by_account, cfg["batch_size"], cfg["spacing_seconds"],
         )
@@ -2583,6 +2668,7 @@ def retry_stale_impl(trigger="manual", chain_hook=None) -> dict:
         logger.exception("[VOD-SWEEP] retry failed (ignored)")
         return summary
     finally:
+        _release_run_lock(lock)
         try:
             close_old_connections()
         except Exception:

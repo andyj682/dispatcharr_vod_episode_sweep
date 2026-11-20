@@ -56,7 +56,7 @@ class Plugin:
     # UI title only. README / repo / zip keep the fuller "Dispatcharr VOD
     # Episode Sweep" name; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Episode Sweep"
-    version = "1.2.0"
+    version = "1.2.1"
     description = (
         "Learns which VOD series a client syncs and refreshes ALL of each watched "
         "show's provider/category relations so new episodes stop going missing. "
@@ -287,6 +287,7 @@ class Plugin:
                            "timer.",
             "button_label": "Run now",
             "button_variant": "filled",
+            "async": True,
         },
         {
             "id": "retry_stale",
@@ -294,6 +295,7 @@ class Plugin:
             "description": "Retry only relations still flagged stale.",
             "button_label": "Retry stale",
             "button_variant": "filled",
+            "async": True,
         },
         {
             "id": "tmdb_refresh",
@@ -383,22 +385,26 @@ class Plugin:
             }
 
         if action == "refresh_now":
-            # Run inline in this (web) worker -- it fans out the CORE
-            # batch_refresh_series_episodes tasks, which run normally in Celery.
-            # We deliberately do NOT dispatch a plugin task (the default prefork
-            # worker's consumer would reject it as unregistered).
+            # Runs in whatever process runs the action: the web worker through
+            # Dispatcharr 0.33, a background worker from 0.34 (where "async"
+            # makes the button return at once and show progress; older
+            # releases ignore the flag). Either way it only fans out the CORE
+            # batch_refresh_series_episodes tasks.
             try:
-                summary = _patch.run_sweep_impl()
-                return {"status": "ok", "message": f"Sweep ran: {summary}"}
+                summary = _patch.run_sweep_impl(
+                    progress=context.get("report_progress"))
+                return {"status": "ok",
+                        "message": _patch.format_run_record("Sweep ran", summary)}
             except Exception as exc:
                 logger.exception("[VOD-SWEEP] refresh_now failed")
                 return {"status": "error", "message": f"Sweep failed: {exc}"}
 
         if action == "retry_stale":
-            # Same inline/web-worker pattern as refresh_now, but scoped to the
-            # relations that are actually stale.
+            # Same pattern as refresh_now, but scoped to the relations that
+            # are actually stale.
             try:
-                summary = _patch.retry_stale_impl()
+                summary = _patch.retry_stale_impl(
+                    progress=context.get("report_progress"))
                 # The compact record line, not the raw dict: the dict carries
                 # per-account-id maps for the chain and overran the toast.
                 return {"status": "ok",

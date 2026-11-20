@@ -127,13 +127,19 @@ list. Only Xtream-Codes VOD series are affected.
   provider it is `WAITING` on (backing off after a failed check) or has
   `GAVE UP` on for the day.
 - **List watched series** — the current watchlist + the path to the debug file.
-- **Run sweep now** — run the sweep inline immediately, ignoring the daily timer.
+- **Run sweep now** — run the sweep immediately, ignoring the daily timer.
 - **Retry stale relations** — re-refresh *only* the relations still flagged
   stale, instead of the whole watchlist. Much cheaper than a full sweep (the
   stale set is normally a small slice of it), and safe to repeat. Use it after
   a provider has recovered from an outage, or when a provider fails a fraction
   of its requests: because those failures are independent, each pass clears
   most of what the last one missed.
+
+  On Dispatcharr 0.34+ these two run in the background: the button returns at
+  once, shows progress, and the result appears in the plugin's run history.
+  Only one sweep or manual retry runs at a time, so a second click while one is
+  still going returns "another sweep or retry is still running" instead of
+  starting a duplicate. (On older releases they run while you wait, as before.)
 - **Update TMDB schedules** — look up airing schedules now, in the background
   (needs a TMDB key). Also happens automatically after each sweep; useful right
   after adding a key.
@@ -221,6 +227,13 @@ required.
    dropped only when your client has ignored 3 refreshes of it and it is past
    the TTL (or after 120 days unseen). Turn **Prioritize refresh by airing status** off to
    get the pre-1.2.0 refresh behavior back exactly.
+8. **Dispatcharr 0.34 runs plugin actions in a background worker.** A button
+   that takes longer than about a minute shows a timeout there while the work
+   carries on. From 1.2.1, **Run sweep now** and **Retry stale relations** are
+   background actions, so they return at once instead. With 1.2.0 on 0.34,
+   don't click again after a timeout: check **Show status** a few minutes later.
+   The `pid=` in Show status is now the background worker's, not a streaming
+   worker's; nothing else in it changes.
 
 ## Storage
 

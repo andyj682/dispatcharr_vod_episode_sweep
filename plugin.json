@@ -1,6 +1,6 @@
 {
   "name": "VOD Episode Sweep",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Learns which VOD series a client syncs and refreshes ALL of each watched show's provider/category relations so new episodes stop going missing. Scoped to only the series you sync; runs in the background.",
   "author": "andyj682",
   "help_url": "https://github.com/andyj682/dispatcharr_vod_episode_sweep",
@@ -137,14 +137,16 @@
       "label": "Run sweep now",
       "description": "Run the episode sweep now, regardless of the daily timer.",
       "button_label": "Run now",
-      "button_variant": "filled"
+      "button_variant": "filled",
+      "async": true
     },
     {
       "id": "retry_stale",
       "label": "Retry stale relations",
       "description": "Retry only relations still flagged stale.",
       "button_label": "Retry stale",
-      "button_variant": "filled"
+      "button_variant": "filled",
+      "async": true
     },
     {
       "id": "tmdb_refresh",

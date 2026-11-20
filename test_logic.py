@@ -124,6 +124,12 @@ class FakeRedis:
         ENV.redis[key] = val
         return True
 
+    def get(self, key):
+        return ENV.redis.get(key)
+
+    def delete(self, key):
+        return 1 if ENV.redis.pop(key, None) is not None else 0
+
 
 # --------------------------------------------------------------------------- #
 # Fake query helpers
@@ -2729,6 +2735,147 @@ def test_status_shows_tiers_and_names():
     check("non-default queue and TTL are shown", "q=alt" in odd and "ttl=45d" in odd)
 
 
+# --------------------------------------------------------------------------- #
+# 1.2.1: Dispatcharr 0.34 runs actions in a background worker
+# --------------------------------------------------------------------------- #
+
+def test_run_lock_blocks_a_second_run():
+    """On 0.34 a long button times out in the UI while the run carries on, so
+    a second click must not start a second sweep beside it."""
+    print("test_run_lock_blocks_a_second_run")
+    reset()
+    seed_relations()
+    patch._observe(11)
+    patch._observe(21)
+    ENV.redis[patch.RUN_LOCK_KEY] = "someone-else"
+    summary = patch.run_sweep_impl()
+    check("a sweep started while another runs is skipped",
+          summary["skipped"] == patch.RUN_LOCK_BUSY)
+    check("...and queues nothing", ENV.enqueued == [])
+    check("...and records no sweep (it would replace the running one's chain)",
+          patch.get_watchlist(force=True).get("last_sweep") is None)
+    check("...and leaves the other run's lock alone",
+          ENV.redis.get(patch.RUN_LOCK_KEY) == "someone-else")
+
+    rows = [{"m3u_account_id": 7, "m3u_account__name": "Provider1", "series_id": 200}]
+    saved = _stub_stale(rows)
+    try:
+        manual = patch.retry_stale_impl()
+        chained = patch.retry_stale_impl(trigger="auto", chain_hook=lambda _c: set())
+    finally:
+        patch._stale_rows = saved
+    check("a manual retry is skipped while a run holds the lock",
+          manual["skipped"] == patch.RUN_LOCK_BUSY)
+    check("a chain pass is not blocked by the lock (a click never queues one)",
+          chained["skipped"] is None and chained["tasks"] == 1)
+
+
+def test_run_lock_is_released():
+    print("test_run_lock_is_released")
+    reset()
+    seed_relations()
+    patch._observe(11)
+    patch._observe(21)
+    first = patch.run_sweep_impl()
+    check("a normal sweep runs", first["skipped"] is None and first["tasks"] == 2)
+    check("...and releases the lock when done", patch.RUN_LOCK_KEY not in ENV.redis)
+    rows = [{"m3u_account_id": 7, "m3u_account__name": "Provider1", "series_id": 200}]
+    saved = _stub_stale(rows)
+    try:
+        retry = patch.retry_stale_impl()
+    finally:
+        patch._stale_rows = saved
+    check("a manual retry then runs", retry["skipped"] is None and retry["tasks"] == 1)
+    check("...and releases the lock too", patch.RUN_LOCK_KEY not in ENV.redis)
+
+    # A run that raises midway still releases.
+    saved_rows = patch._relation_rows
+    patch._relation_rows = lambda pks: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        patch.run_sweep_impl()
+    finally:
+        patch._relation_rows = saved_rows
+    check("a failed sweep still releases the lock", patch.RUN_LOCK_KEY not in ENV.redis)
+
+
+def test_run_lock_owner_and_fail_open():
+    print("test_run_lock_owner_and_fail_open")
+    reset()
+    ENV.redis[patch.RUN_LOCK_KEY] = "theirs"
+    patch._release_run_lock("mine")
+    check("releasing with someone else's token leaves their lock",
+          ENV.redis.get(patch.RUN_LOCK_KEY) == "theirs")
+    ENV.redis[patch.RUN_LOCK_KEY] = b"bytes-token"
+    patch._release_run_lock("bytes-token")
+    check("a bytes value from a non-decoding client still matches",
+          patch.RUN_LOCK_KEY not in ENV.redis)
+
+    seed_relations()
+    patch._observe(11)
+    patch._observe(21)
+    saved = patch._get_redis
+    patch._get_redis = lambda: None
+    try:
+        summary = patch.run_sweep_impl()
+    finally:
+        patch._get_redis = saved
+    check("with Redis unavailable the sweep runs unlocked (fail-open)",
+          summary["skipped"] is None and summary["tasks"] == 2)
+
+
+def test_progress_is_reported_and_harmless():
+    print("test_progress_is_reported_and_harmless")
+    reset()
+    seed_relations()
+    patch._observe(11)
+    patch._observe(21)
+    seen = []
+    patch.run_sweep_impl(progress=lambda pct, msg: seen.append((pct, msg)))
+    pcts = [p for p, _ in seen]
+    check("a sweep reports progress in rising steps",
+          len(pcts) >= 3 and pcts == sorted(pcts) and pcts[-1] >= 80)
+    check("progress messages are text", all(isinstance(m, str) and m for _, m in seen))
+
+    def broken(pct, msg):
+        raise RuntimeError("progress endpoint down")
+    reset()
+    seed_relations()
+    patch._observe(11)
+    patch._observe(21)
+    summary = patch.run_sweep_impl(progress=broken)
+    check("a failing progress callback never touches the run",
+          summary["skipped"] is None and summary["tasks"] == 2)
+
+    seen = []
+    rows = [{"m3u_account_id": 7, "m3u_account__name": "Provider1", "series_id": 200}]
+    saved = _stub_stale(rows)
+    try:
+        patch.retry_stale_impl(progress=lambda pct, msg: seen.append(pct))
+    finally:
+        patch._stale_rows = saved
+    check("a retry reports progress too", len(seen) >= 3 and seen == sorted(seen))
+
+
+def test_long_actions_run_in_the_background():
+    """Dispatcharr 0.34 waits 55 s for a plain action, then shows a timeout.
+    The two run-the-sweep buttons must be background actions; quick ones
+    stay plain so their answer shows in place. (plugin.json is held to the
+    same by test_manifest_parity.)"""
+    print("test_long_actions_run_in_the_background")
+    import ast
+    here = os.path.dirname(os.path.abspath(__file__))
+    tree = ast.parse(open(os.path.join(here, "plugin.py"), encoding="utf-8").read())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Plugin")
+    actions = next(ast.literal_eval(n.value) for n in cls.body
+                   if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "actions")
+    flags = {a["id"]: bool(a.get("async")) for a in actions}
+    check("Run now and Retry stale are background actions",
+          flags.get("refresh_now") and flags.get("retry_stale"))
+    check("quick actions stay plain",
+          not any(flags[a] for a in ("status", "list_watchlist", "tmdb_refresh",
+                                     "clear_watchlist")))
+
+
 if __name__ == "__main__":
     test_observation_records_and_dedupes()
     test_wrapper_passthrough()
@@ -2783,6 +2930,11 @@ if __name__ == "__main__":
     test_chain_waits_out_the_quiet_window()
     test_manual_retry_ignores_the_chain()
     test_manifest_parity()
+    test_run_lock_blocks_a_second_run()
+    test_run_lock_is_released()
+    test_run_lock_owner_and_fail_open()
+    test_progress_is_reported_and_harmless()
+    test_long_actions_run_in_the_background()
     test_enqueue_failure_tolerated()
     test_series_id_mode_detection()
     test_v033_series_id_is_the_series_pk()

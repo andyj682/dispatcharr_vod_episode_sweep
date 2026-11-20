@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - Unreleased
+
+For Dispatcharr 0.34, which runs plugin action buttons in a background worker
+and shows a timeout for any that take longer than about a minute while the
+work carries on. Nothing changes on older releases.
+
+### Changed
+
+- **Run sweep now** and **Retry stale relations** are background actions on
+  0.34+: the button returns at once, shows progress, and the result lands in
+  the plugin's run history. Run sweep now's result is now the same compact
+  line as Show status instead of the raw summary.
+
+### Fixed
+
+- **Only one sweep or manual retry runs at a time.** A second click while one
+  is still deciding and queueing, or a click during the scheduled sweep, now
+  returns "another sweep or retry is still running" instead of starting a
+  duplicate that doubled the calls to every provider. The automatic retry
+  passes aren't affected. If Redis is unavailable, runs go ahead unlocked, as
+  before.
+
+### Tests
+
+- 425 → 445 checks: the run lock (a second run skipped and records nothing,
+  released after success and after a failure, released only by its owner,
+  fail-open without Redis, retry chain passes never blocked), progress reports
+  (rising, and a failing reporter never touches the run), and the two buttons
+  marked as background actions. Each new guard was mutation-checked.
+
 ## [1.2.0] - 2026-10-30
 
 Refreshes what can actually have changed instead of everything, every day.
